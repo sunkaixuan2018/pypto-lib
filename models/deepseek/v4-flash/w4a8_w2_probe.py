@@ -41,6 +41,7 @@ _ENTRY = _KERNEL_DIR / "entry.cpp"
 _TOPOLOGY_ENTRY = _KERNEL_DIR / "topology_entry.cpp"
 _CROSSCORE_ENTRY = _KERNEL_DIR / "crosscore_entry.cpp"
 _RESOURCE_ENTRY = _KERNEL_DIR / "resource_entry.cpp"
+_BLOCKMMAD_ENTRY = _KERNEL_DIR / "blockmmad_entry.cpp"
 _CATLASS_INCLUDE = _REPO_ROOT / "third_party" / "catlass" / "include"
 
 
@@ -110,6 +111,27 @@ def crosscore_handshake_cce(handshake: pl.Out[pl.Tensor]) -> pl.Tensor: ...
     dual_aiv_dispatch=True,
 )
 def resource_lifecycle_cce(lifecycle: pl.Out[pl.Tensor]) -> pl.Tensor: ...
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_BLOCKMMAD_ENTRY,
+    aiv_source=_BLOCKMMAD_ENTRY,
+    include_dirs=_EXTERN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def blockmmad_lifecycle_cce(lifecycle: pl.Out[pl.Tensor]) -> pl.Tensor: ...
+
+
+@pl.jit
+def blockmmad_lifecycle_test(
+    lifecycle: pl.Out[pl.Tensor[[BLOCK_DIM * 3, 16], pl.INT32]],
+):
+    # Construct and destroy the exact W4 BlockMmad type without entering its
+    # prologue or matmul body.
+    with pl.spmd(BLOCK_DIM, name_hint="blockmmad_lifecycle", sync_start=True):
+        lifecycle = blockmmad_lifecycle_cce(lifecycle)
+    return lifecycle
 
 
 @pl.jit
@@ -291,6 +313,38 @@ def build_resource_specs():
     ]
 
 
+def build_blockmmad_specs():
+    import torch
+    from golden import TensorSpec
+
+    return [
+        TensorSpec(
+            "blockmmad_lifecycle",
+            [BLOCK_DIM * 3, 16],
+            torch.int32,
+            is_output=True,
+        ),
+    ]
+
+
+def golden_blockmmad(tensors):
+    import torch
+
+    # engine, block, lane, before, resource-ready, BlockMmad ctor/dtor,
+    # Resource dtor, base-mod-64
+    expected = torch.zeros(BLOCK_DIM * 3, 16, dtype=torch.int32)
+    for block_idx in range(BLOCK_DIM):
+        expected[block_idx, :9] = torch.tensor(
+            [1, block_idx, -1, 1, 1, 1, 1, 1, 0], dtype=torch.int32
+        )
+        for lane in range(2):
+            row = BLOCK_DIM + block_idx * 2 + lane
+            expected[row, :9] = torch.tensor(
+                [2, block_idx, lane, 1, 1, 1, 1, 1, 0], dtype=torch.int32
+            )
+    tensors["blockmmad_lifecycle"][:] = expected
+
+
 def golden_resource(tensors):
     import torch
 
@@ -384,7 +438,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--variant",
-        choices=("w4a8", "int8", "topology", "crosscore", "resource"),
+        choices=(
+            "w4a8",
+            "int8",
+            "topology",
+            "crosscore",
+            "resource",
+            "blockmmad",
+        ),
         required=True,
     )
     parser.add_argument("-p", "--platform", default="a2a3", choices=("a2a3", "a2a3sim"))
@@ -397,9 +458,12 @@ if __name__ == "__main__":
     is_topology = args.variant == "topology"
     is_crosscore = args.variant == "crosscore"
     is_resource = args.variant == "resource"
+    is_blockmmad = args.variant == "blockmmad"
     result = run_jit(
         fn=(
-            resource_lifecycle_test
+            blockmmad_lifecycle_test
+            if is_blockmmad
+            else resource_lifecycle_test
             if is_resource
             else crosscore_handshake_test
             if is_crosscore
@@ -410,7 +474,9 @@ if __name__ == "__main__":
             else int8_w2_test
         ),
         specs=(
-            build_resource_specs()
+            build_blockmmad_specs()
+            if is_blockmmad
+            else build_resource_specs()
             if is_resource
             else build_crosscore_specs()
             if is_crosscore
@@ -421,7 +487,9 @@ if __name__ == "__main__":
             else build_int8_specs()
         ),
         golden_fn=(
-            golden_resource
+            golden_blockmmad
+            if is_blockmmad
+            else golden_resource
             if is_resource
             else golden_crosscore
             if is_crosscore
