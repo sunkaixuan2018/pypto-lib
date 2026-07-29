@@ -425,7 +425,7 @@ def combine(
         name_hint="shared_routed_hc_post",
         deps=[_cwait_tid],
         allow_early_resolve=True,
-    ):
+    ) as _fused_tail_tid:
         t = pl.tile.get_block_idx()
         acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
         if t < active_tokens:
