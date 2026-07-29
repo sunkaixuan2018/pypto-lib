@@ -185,22 +185,14 @@ def expert_routed(
                     eh_q_half = pl.cast(eh_q_i32, target_type=pl.FP16, mode="round")
                     h_tile_i8[:, k1 : k1 + QUANT_TILE] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
 
-            # Keep each W2 accumulator tile inside one mixed Cube+Vector task:
-            # matmul -> dequant/route-weight -> BF16.  This avoids materializing
-            # the full INT32 W2 output in GM and launching a second epilogue task.
-            recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
+            y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
             with pl.spmd(
                 D // (W2_INNER * D_OUT_TILE),
-                name_hint="exp_w2_mm_act",
+                name_hint="exp_w2_mm",
                 allow_early_resolve=True,
             ):
                 wb_idx = pl.tile.get_block_idx()
                 d_base = wb_idx * (W2_INNER * D_OUT_TILE)
-                w_col_blk = pl.reshape(
-                    recv_weights[local_e : local_e + 1, tt0 : tt0 + RECV_TILE],
-                    [RECV_TILE, 1],
-                )
-                row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
                 for dg in pl.range(W2_INNER):
                     d0 = d_base + dg * D_OUT_TILE
                     y_acc = pl.create_tensor([1, RECV_TILE, D_OUT_TILE], dtype=pl.INT32)
@@ -211,11 +203,28 @@ def expert_routed(
                             y_acc = pl.matmul(h_k, w2_k, b_trans=True, out_dtype=pl.INT32)
                         else:
                             y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
-                    y_2d_i32 = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
-                    w2_scale_chunk = routed_w2_scale[local_e : local_e + 1, d0 : d0 + D_OUT_TILE]
+                    y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
+
+            recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
+            with pl.spmd(
+                D // (W2_ACT_INNER * D_OUT_TILE_ACT),
+                name_hint="exp_w2_act",
+                allow_early_resolve=True,
+            ):
+                db_idx = pl.tile.get_block_idx()
+                act_d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
+                w_col_blk = pl.reshape(
+                    recv_weights[local_e : local_e + 1, tt0 : tt0 + RECV_TILE],
+                    [RECV_TILE, 1],
+                )
+                row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
+                for dg in pl.pipeline(W2_ACT_INNER, stage=2):
+                    act_d0 = act_d_base + dg * D_OUT_TILE_ACT
+                    y_2d_i32 = y_i32[:, act_d0 : act_d0 + D_OUT_TILE_ACT]
+                    w2_scale_chunk = routed_w2_scale[local_e : local_e + 1, act_d0 : act_d0 + D_OUT_TILE_ACT]
                     y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
                     y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, row_scale_blk), w2_scale_chunk)
-                    recv_y_tile[:, d0 : d0 + D_OUT_TILE] = pl.cast(
+                    recv_y_tile[:, act_d0 : act_d0 + D_OUT_TILE_ACT] = pl.cast(
                         y_2d, target_type=pl.BF16, mode="rint"
                     )
             recv_y_flat = pl.assemble(recv_y_flat, recv_y_tile, [flat_tt0, 0])
