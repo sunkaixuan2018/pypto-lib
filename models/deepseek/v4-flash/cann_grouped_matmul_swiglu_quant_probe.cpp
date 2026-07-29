@@ -98,7 +98,7 @@ int main(int argc, char **argv)
     const size_t weightScaleBytes =
         static_cast<size_t>(kExperts * kW13N) * sizeof(uint64_t);
     const size_t assistBytes = static_cast<size_t>(kExperts * kW13N) * sizeof(float);
-    const size_t xScaleBytes = static_cast<size_t>(kM);
+    const size_t xScaleBytes = static_cast<size_t>(kM) * sizeof(float);
     const size_t groupListBytes = static_cast<size_t>(kExperts) * sizeof(int64_t);
     const size_t outputBytes = static_cast<size_t>(kM * kOutputN);
     const size_t outputScaleBytes = static_cast<size_t>(kM) * sizeof(float);
@@ -115,7 +115,7 @@ int main(int argc, char **argv)
     constexpr uint64_t kPackedUnitScales = 0x3F8000003F800000ULL;
     std::vector<uint64_t> weightScaleHost(
         static_cast<size_t>(kExperts * kW13N), kPackedUnitScales);
-    std::vector<uint8_t> xScaleHost(static_cast<size_t>(kM), 127U);
+    std::vector<float> xScaleHost(static_cast<size_t>(kM), 1.0F);
     std::vector<int64_t> groupListHost(static_cast<size_t>(kExperts), kRowsPerExpert);
     CHECK_ACL(aclrtMemcpy(
         weightScaleDevice, weightScaleBytes, weightScaleHost.data(), weightScaleBytes,
@@ -128,7 +128,7 @@ int main(int argc, char **argv)
 
     aclTensor *x = CreateTensor(xDevice, {kM, kK}, ACL_INT8, ACL_FORMAT_ND);
     aclTensor *xScale =
-        CreateTensor(xScaleDevice, {kM}, ACL_FLOAT8_E8M0, ACL_FORMAT_ND);
+        CreateTensor(xScaleDevice, {kM}, ACL_FLOAT, ACL_FORMAT_ND);
     aclTensor *groupList =
         CreateTensor(groupListDevice, {kExperts}, ACL_INT64, ACL_FORMAT_ND);
     aclTensor *output =
