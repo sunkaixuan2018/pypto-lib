@@ -164,28 +164,22 @@ int main(int argc, char **argv)
     std::vector<const aclTensor *> weightItems;
     std::vector<const aclTensor *> weightScaleItems;
     std::vector<const aclTensor *> assistItems;
-    const size_t weightBytesPerExpert = PackedInt4Bytes(kK * kW13N);
-    const size_t weightScaleBytesPerExpert =
-        static_cast<size_t>(kW13N) * sizeof(uint64_t);
-    const size_t assistBytesPerExpert = static_cast<size_t>(kW13N) * sizeof(float);
-    for (int64_t expert = 0; expert < kExperts; ++expert) {
-        aclTensor *weight = CreateTensor(
-            static_cast<uint8_t *>(weightDevice) + expert * weightBytesPerExpert,
-            {kK, kW13N}, ACL_INT4, ACL_FORMAT_FRACTAL_NZ,
-            {kK / 64, kW13N / 16, 16, 64});
-        aclTensor *weightScale = CreateTensor(
-            static_cast<uint8_t *>(weightScaleDevice) + expert * weightScaleBytesPerExpert,
-            {kW13N}, ACL_UINT64, ACL_FORMAT_ND);
-        aclTensor *assist = CreateTensor(
-            static_cast<uint8_t *>(assistDevice) + expert * assistBytesPerExpert, {kW13N},
-            ACL_FLOAT, ACL_FORMAT_ND);
-        weightTensors.push_back(weight);
-        weightScaleTensors.push_back(weightScale);
-        assistTensors.push_back(assist);
-        weightItems.push_back(weight);
-        weightScaleItems.push_back(weightScale);
-        assistItems.push_back(assist);
-    }
+    // Match the upstream MoE call contract: one tensor-list item whose leading
+    // dimension contains every local expert.  The older multi-item probe
+    // exercised a different path from vLLM-Ascend's W4A8 implementation.
+    aclTensor *weight = CreateTensor(
+        weightDevice, {kExperts, kK, kW13N}, ACL_INT4, ACL_FORMAT_FRACTAL_NZ,
+        {kExperts, kW13N / 64, kK / 16, 16, 64});
+    aclTensor *weightScale = CreateTensor(
+        weightScaleDevice, {kExperts, kW13N}, ACL_UINT64, ACL_FORMAT_ND);
+    aclTensor *assist = CreateTensor(
+        assistDevice, {kExperts, kW13N}, ACL_FLOAT, ACL_FORMAT_ND);
+    weightTensors.push_back(weight);
+    weightScaleTensors.push_back(weightScale);
+    assistTensors.push_back(assist);
+    weightItems.push_back(weight);
+    weightScaleItems.push_back(weightScale);
+    assistItems.push_back(assist);
     aclTensorList *weights = aclCreateTensorList(weightItems.data(), weightItems.size());
     aclTensorList *weightScales =
         aclCreateTensorList(weightScaleItems.data(), weightScaleItems.size());
