@@ -96,7 +96,7 @@ def expert_routed(
             gate_flat_base = gate_local_i * RECV_MAX
             gate_e = gate_i32[gate_flat_base : gate_flat_base + RECV_MAX]
             n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
-            for ng in pl.range(MM_GATE_INNER):
+            for ng in pl.pipeline(MM_GATE_INNER, stage=1):
                 n0 = n_base + ng * MM_INTER_TILE
                 gate_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
                 for k0 in pl.pipeline(0, D, K_TILE, stage=2):
@@ -127,7 +127,7 @@ def expert_routed(
             up_flat_base = up_local_i * RECV_MAX
             up_e = up_i32[up_flat_base : up_flat_base + RECV_MAX]
             u_base = ub_idx * (MM_GATE_INNER * MM_INTER_TILE)
-            for ug in pl.range(MM_GATE_INNER):
+            for ug in pl.pipeline(MM_GATE_INNER, stage=1):
                 u0 = u_base + ug * MM_INTER_TILE
                 up_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
                 for uk0 in pl.pipeline(0, D, K_TILE, stage=2):
