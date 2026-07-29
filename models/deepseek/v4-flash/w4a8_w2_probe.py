@@ -40,6 +40,7 @@ _KERNEL_DIR = Path(__file__).parent / "kernels" / "w4a8_w2"
 _ENTRY = _KERNEL_DIR / "entry.cpp"
 _TOPOLOGY_ENTRY = _KERNEL_DIR / "topology_entry.cpp"
 _CROSSCORE_ENTRY = _KERNEL_DIR / "crosscore_entry.cpp"
+_RESOURCE_ENTRY = _KERNEL_DIR / "resource_entry.cpp"
 _CATLASS_INCLUDE = _REPO_ROOT / "third_party" / "catlass" / "include"
 
 
@@ -99,6 +100,27 @@ def mixed_topology_cce(topology: pl.Out[pl.Tensor]) -> pl.Tensor: ...
     dual_aiv_dispatch=True,
 )
 def crosscore_handshake_cce(handshake: pl.Out[pl.Tensor]) -> pl.Tensor: ...
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_RESOURCE_ENTRY,
+    aiv_source=_RESOURCE_ENTRY,
+    include_dirs=_EXTERN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def resource_lifecycle_cce(lifecycle: pl.Out[pl.Tensor]) -> pl.Tensor: ...
+
+
+@pl.jit
+def resource_lifecycle_test(
+    lifecycle: pl.Out[pl.Tensor[[BLOCK_DIM * 3, 16], pl.INT32]],
+):
+    # Add only Catlass Resource/TPipe lifetime around the already validated
+    # single-stage CrossCore handshake.
+    with pl.spmd(BLOCK_DIM, name_hint="resource_lifecycle", sync_start=True):
+        lifecycle = resource_lifecycle_cce(lifecycle)
+    return lifecycle
 
 
 @pl.jit
@@ -255,6 +277,38 @@ def build_crosscore_specs():
     ]
 
 
+def build_resource_specs():
+    import torch
+    from golden import TensorSpec
+
+    return [
+        TensorSpec(
+            "lifecycle",
+            [BLOCK_DIM * 3, 16],
+            torch.int32,
+            is_output=True,
+        ),
+    ]
+
+
+def golden_resource(tensors):
+    import torch
+
+    # engine, logical block, lane, before, resource-ready, handshake-done,
+    # resource-destroyed, base-mod-64
+    expected = torch.zeros(BLOCK_DIM * 3, 16, dtype=torch.int32)
+    for block_idx in range(BLOCK_DIM):
+        expected[block_idx, :8] = torch.tensor(
+            [1, block_idx, -1, 1, 1, 1, 1, 0], dtype=torch.int32
+        )
+        for lane in range(2):
+            row = BLOCK_DIM + block_idx * 2 + lane
+            expected[row, :8] = torch.tensor(
+                [2, block_idx, lane, 1, 1, 1, 1, 0], dtype=torch.int32
+            )
+    tensors["lifecycle"][:] = expected
+
+
 def golden_crosscore(tensors):
     import torch
 
@@ -330,7 +384,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--variant",
-        choices=("w4a8", "int8", "topology", "crosscore"),
+        choices=("w4a8", "int8", "topology", "crosscore", "resource"),
         required=True,
     )
     parser.add_argument("-p", "--platform", default="a2a3", choices=("a2a3", "a2a3sim"))
@@ -342,9 +396,12 @@ if __name__ == "__main__":
     is_w4 = args.variant == "w4a8"
     is_topology = args.variant == "topology"
     is_crosscore = args.variant == "crosscore"
+    is_resource = args.variant == "resource"
     result = run_jit(
         fn=(
-            crosscore_handshake_test
+            resource_lifecycle_test
+            if is_resource
+            else crosscore_handshake_test
             if is_crosscore
             else mixed_topology_test
             if is_topology
@@ -353,7 +410,9 @@ if __name__ == "__main__":
             else int8_w2_test
         ),
         specs=(
-            build_crosscore_specs()
+            build_resource_specs()
+            if is_resource
+            else build_crosscore_specs()
             if is_crosscore
             else build_topology_specs()
             if is_topology
@@ -362,7 +421,9 @@ if __name__ == "__main__":
             else build_int8_specs()
         ),
         golden_fn=(
-            golden_crosscore
+            golden_resource
+            if is_resource
+            else golden_crosscore
             if is_crosscore
             else golden_topology
             if is_topology
