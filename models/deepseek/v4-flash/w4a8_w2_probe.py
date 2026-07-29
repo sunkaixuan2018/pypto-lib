@@ -82,7 +82,7 @@ def int8_w2_test(
         n_base = block_idx * 4 * 256
         for inner in pl.range(4):
             n0 = n_base + inner * 256
-            acc = pl.create_tensor([1, M, 256], dtype=pl.INT32)
+            acc = pl.create_tensor([M, 256], dtype=pl.INT32)
             for k0 in pl.pipeline(0, K, 512, stage=2):
                 a_k = activation[:, k0 : k0 + 512]
                 b_k = weight_nk[n0 : n0 + 256, k0 : k0 + 512]
@@ -90,7 +90,7 @@ def int8_w2_test(
                     acc = pl.matmul(a_k, b_k, b_trans=True, out_dtype=pl.INT32)
                 else:
                     acc = pl.matmul_acc(acc, a_k, b_k, b_trans=True)
-            out[:, n0 : n0 + 256] = pl.reshape(acc, [M, 256])
+            out[:, n0 : n0 + 256] = acc
     return out
 
 
