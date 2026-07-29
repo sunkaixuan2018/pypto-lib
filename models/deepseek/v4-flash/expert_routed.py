@@ -36,6 +36,8 @@ K_TILE = 512
 INTER_K = 512
 MM_INTER_TILE = 256
 MM_GATE_INNER = 4
+MM_GATE_BLOCKS = MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE)
+EXPERT_GROUP = 4
 ACT_INTER_TILE = 128
 ACT_GATE_INNER = 4
 D_OUT_TILE = 256
@@ -48,6 +50,7 @@ W2_ACT_INNER = 8
 TILES_PER_EXPERT = RECV_MAX // RECV_TILE
 
 assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"
+assert N_LOCAL_EXPERTS % EXPERT_GROUP == 0, "local experts must form whole task groups"
 
 
 @pl.jit.inline
@@ -77,21 +80,27 @@ def expert_routed(
     # including ordering the recv_x read after its producer (the dispatch gather),
     # which a manual scope would not do automatically. The final w2 epilogue
     # assembles each static channel block into recv_y.
-    for local_i in pl.parallel(N_LOCAL_EXPERTS):
-        # This expert's row slab of the two accumulators.
-        flat_base = local_i * RECV_MAX
-        gate_e = gate_i32[flat_base : flat_base + RECV_MAX]
-        up_e = up_i32[flat_base : flat_base + RECV_MAX]
+    # Aggregate four experts into one task while retaining two Cube blocks per
+    # expert. This changes only task-launch granularity: every block still owns
+    # exactly the same expert/N slab and uses the original matmul tiling.
+    for expert_group in pl.parallel(N_LOCAL_EXPERTS // EXPERT_GROUP):
+        group_base = expert_group * EXPERT_GROUP
 
-        n_rows = pl.read(recv_expert_count, [local_i, 0])
-        n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+        with pl.spmd(
+            EXPERT_GROUP * MM_GATE_BLOCKS,
+            name_hint="exp_gate_mm_group4",
+        ):
+            grouped_block = pl.tile.get_block_idx()
+            local_i = group_base + grouped_block // MM_GATE_BLOCKS
+            nb_idx = grouped_block % MM_GATE_BLOCKS
+            flat_base = local_i * RECV_MAX
+            gate_e = gate_i32[flat_base : flat_base + RECV_MAX]
+            n_rows = pl.read(recv_expert_count, [local_i, 0])
+            n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
 
-        for t in pl.parallel(n_tiles):
-            t0 = t * RECV_TILE
-            flat_t0 = flat_base + t0
-
-            with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm"):
-                nb_idx = pl.tile.get_block_idx()
+            for t in pl.range(n_tiles):
+                t0 = t * RECV_TILE
+                flat_t0 = flat_base + t0
                 n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
                 for ng in pl.range(MM_GATE_INNER):
                     n0 = n_base + ng * MM_INTER_TILE
@@ -107,8 +116,21 @@ def expert_routed(
                         gate_acc, [RECV_TILE, MM_INTER_TILE]
                     )
 
-            with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm"):
-                ub_idx = pl.tile.get_block_idx()
+        with pl.spmd(
+            EXPERT_GROUP * MM_GATE_BLOCKS,
+            name_hint="exp_up_mm_group4",
+        ):
+            grouped_block = pl.tile.get_block_idx()
+            local_i = group_base + grouped_block // MM_GATE_BLOCKS
+            ub_idx = grouped_block % MM_GATE_BLOCKS
+            flat_base = local_i * RECV_MAX
+            up_e = up_i32[flat_base : flat_base + RECV_MAX]
+            n_rows = pl.read(recv_expert_count, [local_i, 0])
+            n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+
+            for t in pl.range(n_tiles):
+                t0 = t * RECV_TILE
+                flat_t0 = flat_base + t0
                 u_base = ub_idx * (MM_GATE_INNER * MM_INTER_TILE)
                 for ug in pl.range(MM_GATE_INNER):
                     u0 = u_base + ug * MM_INTER_TILE
