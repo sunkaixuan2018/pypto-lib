@@ -83,7 +83,10 @@ PyptoGetSubBlockNum() {
 namespace {
 
 constexpr uint32_t kM = 16;
-constexpr uint32_t kK = 1024;
+#ifndef PYPTO_INTEGRATED_K
+#define PYPTO_INTEGRATED_K 1024
+#endif
+constexpr uint32_t kK = PYPTO_INTEGRATED_K;
 constexpr uint32_t kN = 4096;
 constexpr uint32_t kBlockDim = 24;
 constexpr uint32_t kActiveBlocks = 16;

@@ -45,6 +45,7 @@ AIC_MMAD_OUTPUT_BYTES = MARKER_BYTES + M * N * 4
 DYNAMIC_MMAD_OUTPUT_BYTES = MARKER_BYTES + M * N * 4
 INTEGRATED_K = 1024
 INTEGRATED_OUTPUT_BYTES = MARKER_BYTES + M * N * 4
+INTEGRATED_WRAP_K = 1536
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _KERNEL_DIR = Path(__file__).parent / "kernels" / "w4a8_w2"
@@ -58,6 +59,7 @@ _TILECAST_ENTRY = _KERNEL_DIR / "tilecast_entry.cpp"
 _AIC_MMAD_ENTRY = _KERNEL_DIR / "aic_mmad_entry.cpp"
 _DYNAMIC_MMAD_ENTRY = _KERNEL_DIR / "dynamic_mmad_entry.cpp"
 _INTEGRATED_ENTRY = _KERNEL_DIR / "integrated_k1024_entry.cpp"
+_INTEGRATED_WRAP_ENTRY = _KERNEL_DIR / "integrated_k1536_entry.cpp"
 _CATLASS_INCLUDE = _REPO_ROOT / "third_party" / "catlass" / "include"
 
 
@@ -204,6 +206,37 @@ def integrated_k1024_cce(
     packed_weight_kn: pl.Tensor,
     workspace: pl.InOut[pl.Tensor],
 ) -> pl.Tensor: ...
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_INTEGRATED_WRAP_ENTRY,
+    aiv_source=_INTEGRATED_WRAP_ENTRY,
+    include_dirs=_EXTERN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def integrated_k1536_cce(
+    output: pl.Out[pl.Tensor],
+    activation: pl.Tensor,
+    packed_weight_kn: pl.Tensor,
+    workspace: pl.InOut[pl.Tensor],
+) -> pl.Tensor: ...
+
+
+@pl.jit
+def integrated_k1536_test(
+    activation: pl.Tensor[[M, INTEGRATED_WRAP_K], pl.INT8],
+    packed_weight_kn: pl.Tensor[[INTEGRATED_WRAP_K, N // 2], pl.INT8],
+    workspace: pl.Tensor[[WORKSPACE_BYTES], pl.INT8],
+    output: pl.Out[pl.Tensor[[INTEGRATED_OUTPUT_BYTES], pl.INT8]],
+):
+    # Three K tiles execute stage 0, stage 1, then exactly one stage-0
+    # wraparound in the stock TileCast + BlockMmad integration.
+    with pl.spmd(BLOCK_DIM, name_hint="integrated_k1536", sync_start=True):
+        output = integrated_k1536_cce(
+            output, activation, packed_weight_kn, workspace
+        )
+    return output
 
 
 @pl.jit
@@ -654,6 +687,82 @@ def build_integrated_specs():
     ]
 
 
+def _integrated_wrap_inputs():
+    import torch
+
+    m = torch.arange(M, dtype=torch.int16)[:, None]
+    k = torch.arange(INTEGRATED_WRAP_K, dtype=torch.int16)[None, :]
+    activation = (((3 * m + 5 * k + 1) % 7) - 3).to(torch.int8)
+
+    k = torch.arange(INTEGRATED_WRAP_K, dtype=torch.int16)[:, None]
+    n = torch.arange(N, dtype=torch.int16)[None, :]
+    weight = (((7 * k + 3 * n + 2) % 9) - 4).to(torch.int8)
+    return activation, weight
+
+
+def build_integrated_wrap_specs():
+    import torch
+    from golden import TensorSpec
+
+    activation, weight = _integrated_wrap_inputs()
+    packed = _pack_int4_kn(weight)
+    return [
+        TensorSpec(
+            "activation",
+            [M, INTEGRATED_WRAP_K],
+            torch.int8,
+            init_value=lambda: activation,
+        ),
+        TensorSpec(
+            "integrated_wrap_packed_weight_kn",
+            [INTEGRATED_WRAP_K, N // 2],
+            torch.int8,
+            init_value=lambda: packed,
+        ),
+        TensorSpec(
+            "integrated_wrap_workspace",
+            [WORKSPACE_BYTES],
+            torch.int8,
+            init_value=lambda: torch.zeros(
+                WORKSPACE_BYTES, dtype=torch.int8
+            ),
+        ),
+        TensorSpec(
+            "integrated_wrap_output",
+            [INTEGRATED_OUTPUT_BYTES],
+            torch.int8,
+            is_output=True,
+        ),
+    ]
+
+
+def golden_integrated_wrap(tensors):
+    import torch
+
+    output = tensors["integrated_wrap_output"]
+    output.zero_()
+    marker = output[:MARKER_BYTES].view(torch.int32).reshape(
+        MARKER_ROWS, MARKER_COLUMNS
+    )
+    for block_idx in range(BLOCK_DIM):
+        active = block_idx < 16
+        marker[block_idx, :9] = torch.tensor(
+            [1, block_idx, -1, 1, 1, 1, int(active), 1, 0],
+            dtype=torch.int32,
+        )
+        for lane in range(2):
+            row = BLOCK_DIM + block_idx * 2 + lane
+            marker[row, :9] = torch.tensor(
+                [2, block_idx, lane, 1, 1, 1, int(active), 1, 0],
+                dtype=torch.int32,
+            )
+    matrix_out = output[MARKER_BYTES:].view(torch.int32).reshape(M, N)
+    matrix_out[:] = _golden_matmul(
+        tensors["activation"],
+        _unpack_int4_kn(tensors["integrated_wrap_packed_weight_kn"]),
+    )
+
+
 def golden_integrated(tensors):
     import torch
 
@@ -984,6 +1093,7 @@ if __name__ == "__main__":
             "aicmmad",
             "dynamicmmad",
             "integrated1024",
+            "integrated1536",
         ),
         required=True,
     )
@@ -1003,9 +1113,12 @@ if __name__ == "__main__":
     is_aicmmad = args.variant == "aicmmad"
     is_dynamicmmad = args.variant == "dynamicmmad"
     is_integrated = args.variant == "integrated1024"
+    is_integrated_wrap = args.variant == "integrated1536"
     result = run_jit(
         fn=(
-            integrated_k1024_test
+            integrated_k1536_test
+            if is_integrated_wrap
+            else integrated_k1024_test
             if is_integrated
             else dynamic_int8_mmad_test
             if is_dynamicmmad
@@ -1028,7 +1141,9 @@ if __name__ == "__main__":
             else int8_w2_test
         ),
         specs=(
-            build_integrated_specs()
+            build_integrated_wrap_specs()
+            if is_integrated_wrap
+            else build_integrated_specs()
             if is_integrated
             else build_dynamic_mmad_specs()
             if is_dynamicmmad
@@ -1051,7 +1166,9 @@ if __name__ == "__main__":
             else build_int8_specs()
         ),
         golden_fn=(
-            golden_integrated
+            golden_integrated_wrap
+            if is_integrated_wrap
+            else golden_integrated
             if is_integrated
             else golden_dynamic_mmad
             if is_dynamicmmad
