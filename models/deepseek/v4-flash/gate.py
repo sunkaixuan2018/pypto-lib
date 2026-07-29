@@ -284,7 +284,8 @@ def gate(
                     [th_idx, hs_k],
                     pl.read(tid2eid, [hs_token, hs_k]),
                 )
-            hs_denom = pl.reshape(pl.row_sum(hs_vals_pad), [1, 1])
+            hs_denom_tmp = pl.create_tile([1, TOPK_PAD], dtype=pl.FP32)
+            hs_denom = pl.reshape(pl.row_sum(hs_vals_pad, hs_denom_tmp), [1, 1])
             hs_weights_pad = pl.mul(pl.row_expand_div(hs_vals_pad, hs_denom), ROUTE_SCALE)
             for hs_k in pl.range(TOPK):
                 pl.write(weights, [th_idx, hs_k], pl.read(hs_weights_pad, [0, hs_k]))
