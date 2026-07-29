@@ -34,6 +34,11 @@ L1_K = 512
 L1_N = 256
 STAGES = 2
 WORKSPACE_BYTES = STAGES * L1_K * L1_N * BLOCK_DIM
+MARKER_ROWS = BLOCK_DIM * 3
+MARKER_COLUMNS = 16
+MARKER_BYTES = MARKER_ROWS * MARKER_COLUMNS * 4
+TILECAST_BYTES = 16 * 4 * L1_K * L1_N
+TILECAST_OUTPUT_BYTES = MARKER_BYTES + TILECAST_BYTES
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _KERNEL_DIR = Path(__file__).parent / "kernels" / "w4a8_w2"
@@ -43,6 +48,7 @@ _CROSSCORE_ENTRY = _KERNEL_DIR / "crosscore_entry.cpp"
 _RESOURCE_ENTRY = _KERNEL_DIR / "resource_entry.cpp"
 _BLOCKMMAD_ENTRY = _KERNEL_DIR / "blockmmad_entry.cpp"
 _PINGPONG_ENTRY = _KERNEL_DIR / "pingpong_entry.cpp"
+_TILECAST_ENTRY = _KERNEL_DIR / "tilecast_entry.cpp"
 _CATLASS_INCLUDE = _REPO_ROOT / "third_party" / "catlass" / "include"
 
 
@@ -132,6 +138,31 @@ def blockmmad_lifecycle_cce(lifecycle: pl.Out[pl.Tensor]) -> pl.Tensor: ...
     dual_aiv_dispatch=True,
 )
 def pingpong_state_cce(state: pl.Out[pl.Tensor]) -> pl.Tensor: ...
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_TILECAST_ENTRY,
+    aiv_source=_TILECAST_ENTRY,
+    include_dirs=_EXTERN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def tilecast_data_cce(
+    output: pl.Out[pl.Tensor],
+    packed_weight_kn: pl.Tensor,
+) -> pl.Tensor: ...
+
+
+@pl.jit
+def tilecast_data_test(
+    packed_weight_kn: pl.Tensor[[K, N // 2], pl.INT8],
+    output: pl.Out[pl.Tensor[[TILECAST_OUTPUT_BYTES], pl.INT8]],
+):
+    # Exercise the real packed-INT4 GM -> UB -> INT8 -> GM path with both AIV
+    # lanes.  Each active block converts four independent [512, 256] tiles.
+    with pl.spmd(BLOCK_DIM, name_hint="tilecast_data", sync_start=True):
+        output = tilecast_data_cce(output, packed_weight_kn)
+    return output
 
 
 @pl.jit
@@ -363,6 +394,82 @@ def build_pingpong_specs():
     ]
 
 
+def _tilecast_weight():
+    import torch
+
+    k = torch.arange(K, dtype=torch.int16)[:, None]
+    n = torch.arange(N, dtype=torch.int16)[None, :]
+    return (((3 * k + 5 * n + 7) % 16) - 8).to(torch.int8)
+
+
+def build_tilecast_specs():
+    import torch
+    from golden import TensorSpec
+
+    packed = _pack_int4_kn(_tilecast_weight())
+    return [
+        TensorSpec(
+            "packed_weight_kn",
+            [K, N // 2],
+            torch.int8,
+            init_value=lambda: packed,
+        ),
+        TensorSpec(
+            "tilecast_output",
+            [TILECAST_OUTPUT_BYTES],
+            torch.int8,
+            is_output=True,
+        ),
+    ]
+
+
+def golden_tilecast(tensors):
+    import torch
+
+    output = tensors["tilecast_output"]
+    output.zero_()
+
+    marker = output[:MARKER_BYTES].view(torch.int32).reshape(
+        MARKER_ROWS, MARKER_COLUMNS
+    )
+    for block_idx in range(BLOCK_DIM):
+        marker[block_idx, :15] = torch.tensor(
+            [1, block_idx, -1, 1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 1],
+            dtype=torch.int32,
+        )
+        for lane in range(2):
+            row = BLOCK_DIM + block_idx * 2 + lane
+            active = block_idx < 16
+            tile_done = [1, 1, 1, 1] if active else [-1, -1, -1, -1]
+            marker[row, :15] = torch.tensor(
+                [
+                    2,
+                    block_idx,
+                    lane,
+                    1,
+                    1,
+                    *tile_done,
+                    1,
+                    1,
+                    1,
+                    0,
+                    int(active),
+                    1,
+                ],
+                dtype=torch.int32,
+            )
+
+    weight = _unpack_int4_kn(tensors["packed_weight_kn"])
+    converted = output[MARKER_BYTES:].reshape(16, 4, L1_K, L1_N)
+    for block_idx in range(16):
+        n0 = block_idx * L1_N
+        for tile_idx in range(4):
+            k0 = tile_idx * L1_K
+            converted[block_idx, tile_idx] = weight[
+                k0 : k0 + L1_K, n0 : n0 + L1_N
+            ]
+
+
 def golden_pingpong(tensors):
     import torch
 
@@ -528,6 +635,7 @@ if __name__ == "__main__":
             "resource",
             "blockmmad",
             "pingpong",
+            "tilecast",
         ),
         required=True,
     )
@@ -543,9 +651,12 @@ if __name__ == "__main__":
     is_resource = args.variant == "resource"
     is_blockmmad = args.variant == "blockmmad"
     is_pingpong = args.variant == "pingpong"
+    is_tilecast = args.variant == "tilecast"
     result = run_jit(
         fn=(
-            pingpong_state_test
+            tilecast_data_test
+            if is_tilecast
+            else pingpong_state_test
             if is_pingpong
             else blockmmad_lifecycle_test
             if is_blockmmad
@@ -560,7 +671,9 @@ if __name__ == "__main__":
             else int8_w2_test
         ),
         specs=(
-            build_pingpong_specs()
+            build_tilecast_specs()
+            if is_tilecast
+            else build_pingpong_specs()
             if is_pingpong
             else build_blockmmad_specs()
             if is_blockmmad
@@ -575,7 +688,9 @@ if __name__ == "__main__":
             else build_int8_specs()
         ),
         golden_fn=(
-            golden_pingpong
+            golden_tilecast
+            if is_tilecast
+            else golden_pingpong
             if is_pingpong
             else golden_blockmmad
             if is_blockmmad
