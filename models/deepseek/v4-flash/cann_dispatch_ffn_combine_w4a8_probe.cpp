@@ -105,10 +105,15 @@ private:
 
 struct RankResult {
     uint64_t workspaceBytes = 0;
+    size_t freeBeforeWeights = 0;
+    size_t freeAfterWeights = 0;
+    size_t totalHbm = 0;
     std::vector<float> measuredUs;
     size_t badOutput = 0;
     std::vector<int32_t> expertTokenNums;
 };
+
+std::mutex gLogMutex;
 
 void *DeviceAlloc(size_t bytes, uint8_t value = 0)
 {
@@ -151,11 +156,16 @@ float Median(std::vector<float> values)
 }
 
 void RunRank(
-    int rank, int device, HcclComm comm, ThreadBarrier &barrier, RankResult &result)
+    int rank, int device, HcclComm comm, bool queryOnly, ThreadBarrier &barrier,
+    RankResult &result)
 {
     CHECK_ACL(aclrtSetDevice(device));
     aclrtStream stream = nullptr;
     CHECK_ACL(aclrtCreateStream(&stream));
+    if (queryOnly) {
+        CHECK_ACL(aclrtGetMemInfo(
+            ACL_HBM_MEM, &result.freeBeforeWeights, &result.totalHbm));
+    }
 
     char commName[COMM_NAME_MAX_LENGTH] = {};
     CHECK_HCCL(HcclGetCommName(comm, commName));
@@ -325,6 +335,21 @@ void RunRank(
         if (run == 0) {
             workspaceBytes = thisWorkspaceBytes;
             result.workspaceBytes = workspaceBytes;
+            if (queryOnly) {
+                CHECK_ACL(aclrtGetMemInfo(
+                    ACL_HBM_MEM, &result.freeAfterWeights, &result.totalHbm));
+                {
+                    std::lock_guard<std::mutex> lock(gLogMutex);
+                    std::cout << "query_rank=" << rank << " device=" << device
+                              << " comm=" << commName
+                              << " workspace_bytes=" << workspaceBytes
+                              << " free_before_weights=" << result.freeBeforeWeights
+                              << " free_after_weights=" << result.freeAfterWeights
+                              << " total_hbm=" << result.totalHbm << std::endl;
+                }
+                barrier.Wait();
+                break;
+            }
             if (workspaceBytes > 0) {
                 CHECK_ACL(
                     aclrtMalloc(&workspace, workspaceBytes, ACL_MEM_MALLOC_HUGE_FIRST));
@@ -358,18 +383,20 @@ void RunRank(
         barrier.Wait();
     }
 
-    std::vector<uint16_t> outputHost(static_cast<size_t>(kTokens * kHidden));
-    result.expertTokenNums.resize(static_cast<size_t>(kLocalExperts));
-    CHECK_ACL(aclrtMemcpy(
-        outputHost.data(), outputBytes, outputDevice, outputBytes,
-        ACL_MEMCPY_DEVICE_TO_HOST));
-    CHECK_ACL(aclrtMemcpy(
-        result.expertTokenNums.data(), expertTokenBytes, expertTokenDevice,
-        expertTokenBytes, ACL_MEMCPY_DEVICE_TO_HOST));
-    result.badOutput = static_cast<size_t>(
-        std::count_if(outputHost.begin(), outputHost.end(), [](uint16_t value) {
-            return value != 0;
-        }));
+    if (!queryOnly) {
+        std::vector<uint16_t> outputHost(static_cast<size_t>(kTokens * kHidden));
+        result.expertTokenNums.resize(static_cast<size_t>(kLocalExperts));
+        CHECK_ACL(aclrtMemcpy(
+            outputHost.data(), outputBytes, outputDevice, outputBytes,
+            ACL_MEMCPY_DEVICE_TO_HOST));
+        CHECK_ACL(aclrtMemcpy(
+            result.expertTokenNums.data(), expertTokenBytes, expertTokenDevice,
+            expertTokenBytes, ACL_MEMCPY_DEVICE_TO_HOST));
+        result.badOutput = static_cast<size_t>(
+            std::count_if(outputHost.begin(), outputHost.end(), [](uint16_t value) {
+                return value != 0;
+            }));
+    }
 
     if (workspace != nullptr) {
         CHECK_ACL(aclrtFree(workspace));
@@ -403,6 +430,9 @@ void RunRank(
 int main(int argc, char **argv)
 {
     const std::string deviceText = argc > 1 ? argv[1] : "0,2,4,6,8,10,12,14";
+    const char *queryOnlyEnv = std::getenv("W4A8_QUERY_ONLY");
+    const bool queryOnly =
+        queryOnlyEnv != nullptr && std::string(queryOnlyEnv) != "0";
     std::vector<int32_t> devices = ParseDevices(deviceText);
     if (devices.size() != kWorldSize) {
         std::cerr << "expected " << kWorldSize << " devices, got " << devices.size()
@@ -424,11 +454,20 @@ int main(int argc, char **argv)
     for (int rank = 0; rank < kWorldSize; ++rank) {
         workers.emplace_back(
             RunRank, rank, devices[static_cast<size_t>(rank)],
-            comms[static_cast<size_t>(rank)], std::ref(barrier),
+            comms[static_cast<size_t>(rank)], queryOnly, std::ref(barrier),
             std::ref(results[static_cast<size_t>(rank)]));
     }
     for (std::thread &worker : workers) {
         worker.join();
+    }
+
+    if (queryOnly) {
+        std::cout << "query_only=PASS ranks=" << kWorldSize << '\n';
+        for (HcclComm comm : comms) {
+            CHECK_HCCL(HcclCommDestroy(comm));
+        }
+        CHECK_ACL(aclFinalize());
+        return 0;
     }
 
     bool correctness = true;
