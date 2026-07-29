@@ -16,11 +16,13 @@
 #include <aclnnop/aclnn_grouped_matmul_swiglu_quant_weight_nz_v2.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <string>
 #include <vector>
 
 namespace {
@@ -87,6 +89,7 @@ float Median(std::vector<float> values)
 int main(int argc, char **argv)
 {
     const int device = argc > 1 ? std::atoi(argv[1]) : 0;
+    const bool nonzero = argc > 2 && std::string(argv[2]) == "nonzero";
     CHECK_ACL(aclInit(nullptr));
     CHECK_ACL(aclrtSetDevice(device));
 
@@ -111,6 +114,14 @@ int main(int argc, char **argv)
     void *groupListDevice = DeviceAlloc(groupListBytes);
     void *outputDevice = DeviceAlloc(outputBytes);
     void *outputScaleDevice = DeviceAlloc(outputScaleBytes);
+    if (nonzero) {
+        // Every activation is +1 and every signed INT4 weight nibble is +1.
+        // NZ reordering does not change a constant tensor, so this exercises
+        // the packed-nibble, W13, SwiGLU, row-amax, and INT8-rounding path with
+        // a closed-form reference while retaining the production-sized input.
+        CHECK_ACL(aclrtMemset(xDevice, xBytes, 0x01, xBytes));
+        CHECK_ACL(aclrtMemset(weightDevice, weightBytes, 0x11, weightBytes));
+    }
 
     constexpr uint64_t kPackedUnitScales = 0x3F8000003F800000ULL;
     std::vector<uint64_t> weightScaleHost(
@@ -231,21 +242,50 @@ int main(int argc, char **argv)
     }
 
     std::vector<int8_t> outputHost(outputBytes);
+    std::vector<float> outputScaleHost(static_cast<size_t>(kM));
     CHECK_ACL(aclrtMemcpy(
         outputHost.data(), outputBytes, outputDevice, outputBytes,
         ACL_MEMCPY_DEVICE_TO_HOST));
-    const size_t nonzero = static_cast<size_t>(
-        std::count_if(outputHost.begin(), outputHost.end(), [](int8_t value) {
-            return value != 0;
-        }));
-    if (nonzero != 0) {
-        std::cerr << "correctness=FAIL nonzero_output_count=" << nonzero << '\n';
-        return 1;
+    CHECK_ACL(aclrtMemcpy(
+        outputScaleHost.data(), outputScaleBytes, outputScaleDevice, outputScaleBytes,
+        ACL_MEMCPY_DEVICE_TO_HOST));
+    if (nonzero) {
+        const size_t badQuant = static_cast<size_t>(
+            std::count_if(outputHost.begin(), outputHost.end(), [](int8_t value) {
+                return value != 127;
+            }));
+        const float projection = static_cast<float>(kK);
+        const float expectedActivation =
+            projection * projection / (1.0F + std::exp(-projection));
+        const float expectedScale = expectedActivation / 127.0F;
+        const size_t badScale = static_cast<size_t>(std::count_if(
+            outputScaleHost.begin(), outputScaleHost.end(), [expectedScale](float value) {
+                return !std::isfinite(value) ||
+                       std::abs(value - expectedScale) > expectedScale * 0.002F;
+            }));
+        if (badQuant != 0 || badScale != 0) {
+            std::cerr << "correctness=FAIL bad_quant_count=" << badQuant
+                      << " bad_scale_count=" << badScale
+                      << " expected_scale=" << expectedScale
+                      << " actual_scale0=" << outputScaleHost.front() << '\n';
+            return 1;
+        }
+        std::cout << "correctness=PASS constant_nonzero_int4_nz"
+                  << " output_scale0=" << outputScaleHost.front() << '\n';
+    } else {
+        const size_t nonzeroOutput = static_cast<size_t>(
+            std::count_if(outputHost.begin(), outputHost.end(), [](int8_t value) {
+                return value != 0;
+            }));
+        if (nonzeroOutput != 0) {
+            std::cerr << "correctness=FAIL nonzero_output_count=" << nonzeroOutput << '\n';
+            return 1;
+        }
+        std::cout << "correctness=PASS all_zero_output\n";
     }
 
     const float mean =
         std::accumulate(measuredUs.begin(), measuredUs.end(), 0.0F) / measuredUs.size();
-    std::cout << "correctness=PASS all_zero_output\n";
     std::cout << "measured_median_us=" << Median(measuredUs)
               << " measured_mean_us=" << mean << '\n';
 

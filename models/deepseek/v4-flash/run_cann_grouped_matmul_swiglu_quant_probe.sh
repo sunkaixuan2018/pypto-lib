@@ -5,6 +5,7 @@ REPO=/data/sunkaixuan/sunkaixuan_subdir/pypto-lib
 EXPECTED_COMMIT="${EXPECTED_COMMIT:?set EXPECTED_COMMIT to the pushed probe commit}"
 PROBE_BIN=/data/sunkaixuan/codex_sh/cann_gmm_swiglu_quant_probe_20260729
 CANN_ROOT=/usr/local/Ascend/cann-9.0.0
+PROBE_MODE="${PROBE_MODE:-zero}"
 
 cd "$REPO"
 if [[ "$(git rev-parse HEAD)" != "$EXPECTED_COMMIT" ]]; then
@@ -26,4 +27,5 @@ g++ -std=c++17 -O2 \
 
 echo "commit=$(git rev-parse HEAD)"
 echo "device=${TASK_DEVICE:-0}"
-exec "$PROBE_BIN" "${TASK_DEVICE:-0}"
+echo "mode=$PROBE_MODE"
+exec "$PROBE_BIN" "${TASK_DEVICE:-0}" "$PROBE_MODE"
