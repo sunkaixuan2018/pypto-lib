@@ -19,6 +19,7 @@ the probe separate makes the first device run a strict compile/correctness and
 isolated-performance gate before we take on MoE scheduling changes.
 """
 
+import os
 from pathlib import Path
 
 import pypto.language as pl
@@ -40,11 +41,34 @@ _ENTRY = _KERNEL_DIR / "entry.cpp"
 _CATLASS_INCLUDE = _REPO_ROOT / "third_party" / "catlass" / "include"
 
 
+def _cann_include_dirs() -> tuple[Path, ...]:
+    cann_root = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/latest"))
+    devkit = cann_root / "aarch64-linux"
+    candidates = (
+        devkit / "include",
+        devkit / "asc",
+        devkit / "asc" / "include",
+        devkit / "asc" / "include" / "adv_api",
+        devkit / "asc" / "include" / "basic_api",
+        devkit / "asc" / "include" / "c_api",
+        devkit / "asc" / "include" / "interface",
+        devkit / "asc" / "include" / "simt_api",
+        devkit / "asc" / "include" / "utils",
+        devkit / "tikcpp" / "tikcfw",
+        devkit / "tikcpp" / "tikcfw" / "interface",
+        devkit / "tikcpp" / "tikcfw" / "impl",
+    )
+    return tuple(path for path in candidates if path.is_dir())
+
+
+_EXTERN_INCLUDE_DIRS = (_CATLASS_INCLUDE,) + _cann_include_dirs()
+
+
 @pl.jit.extern(
     core_type="mixed",
     aic_source=_ENTRY,
     aiv_source=_ENTRY,
-    include_dirs=(_CATLASS_INCLUDE,),
+    include_dirs=_EXTERN_INCLUDE_DIRS,
     dual_aiv_dispatch=True,
 )
 def w4a8_w2_cce(
