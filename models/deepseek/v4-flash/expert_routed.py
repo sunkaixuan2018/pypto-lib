@@ -95,12 +95,62 @@ def expert_routed(
             nb_idx = grouped_block % MM_GATE_BLOCKS
             flat_base = local_i * RECV_MAX
             gate_e = gate_i32[flat_base : flat_base + RECV_MAX]
-            n_rows = pl.read(recv_expert_count, [local_i, 0])
-            n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+            n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
+            for ng in pl.range(MM_GATE_INNER):
+                n0 = n_base + ng * MM_INTER_TILE
+                gate_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
+                for k0 in pl.pipeline(0, D, K_TILE, stage=2):
+                    x_k = recv_x_flat[flat_base : flat_base + RECV_TILE, k0 : k0 + K_TILE]
+                    w1_k = routed_w1[local_i : local_i + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
+                    if k0 == 0:
+                        gate_acc = pl.matmul(x_k, w1_k, b_trans=True, out_dtype=pl.INT32)
+                    else:
+                        gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
+                gate_e[0 : RECV_TILE, n0 : n0 + MM_INTER_TILE] = pl.reshape(
+                    gate_acc, [RECV_TILE, MM_INTER_TILE]
+                )
 
-            for t in pl.range(n_tiles):
-                t0 = t * RECV_TILE
-                flat_t0 = flat_base + t0
+        with pl.spmd(
+            EXPERT_GROUP * MM_GATE_BLOCKS,
+            name_hint="exp_up_mm_group4",
+        ):
+            grouped_block = pl.tile.get_block_idx()
+            local_i = group_base + grouped_block // MM_GATE_BLOCKS
+            ub_idx = grouped_block % MM_GATE_BLOCKS
+            flat_base = local_i * RECV_MAX
+            up_e = up_i32[flat_base : flat_base + RECV_MAX]
+            u_base = ub_idx * (MM_GATE_INNER * MM_INTER_TILE)
+            for ug in pl.range(MM_GATE_INNER):
+                u0 = u_base + ug * MM_INTER_TILE
+                up_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
+                for uk0 in pl.pipeline(0, D, K_TILE, stage=2):
+                    x_u = recv_x_flat[flat_base : flat_base + RECV_TILE, uk0 : uk0 + K_TILE]
+                    w3_k = routed_w3[local_i : local_i + 1, u0 : u0 + MM_INTER_TILE, uk0 : uk0 + K_TILE]
+                    if uk0 == 0:
+                        up_acc = pl.matmul(x_u, w3_k, b_trans=True, out_dtype=pl.INT32)
+                    else:
+                        up_acc = pl.matmul_acc(up_acc, x_u, w3_k, b_trans=True)
+                up_e[0 : RECV_TILE, u0 : u0 + MM_INTER_TILE] = pl.reshape(
+                    up_acc, [RECV_TILE, MM_INTER_TILE]
+                )
+
+    # Preserve the general RECV_MAX contract. The balanced EP8 decode target has
+    # exactly three rows per expert, so this fallback creates no runtime tasks in
+    # the measured case; it only handles callers with more than one row tile.
+    for local_i in pl.parallel(N_LOCAL_EXPERTS):
+        flat_base = local_i * RECV_MAX
+        gate_e = gate_i32[flat_base : flat_base + RECV_MAX]
+        up_e = up_i32[flat_base : flat_base + RECV_MAX]
+        n_rows = pl.read(recv_expert_count, [local_i, 0])
+        n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+        n_extra_tiles = pl.max(n_tiles - 1, 0)
+
+        for extra_t in pl.parallel(n_extra_tiles):
+            t0 = (extra_t + 1) * RECV_TILE
+            flat_t0 = flat_base + t0
+
+            with pl.spmd(MM_GATE_BLOCKS, name_hint="exp_gate_mm_tail"):
+                nb_idx = pl.tile.get_block_idx()
                 n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
                 for ng in pl.range(MM_GATE_INNER):
                     n0 = n_base + ng * MM_INTER_TILE
@@ -116,21 +166,8 @@ def expert_routed(
                         gate_acc, [RECV_TILE, MM_INTER_TILE]
                     )
 
-        with pl.spmd(
-            EXPERT_GROUP * MM_GATE_BLOCKS,
-            name_hint="exp_up_mm_group4",
-        ):
-            grouped_block = pl.tile.get_block_idx()
-            local_i = group_base + grouped_block // MM_GATE_BLOCKS
-            ub_idx = grouped_block % MM_GATE_BLOCKS
-            flat_base = local_i * RECV_MAX
-            up_e = up_i32[flat_base : flat_base + RECV_MAX]
-            n_rows = pl.read(recv_expert_count, [local_i, 0])
-            n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
-
-            for t in pl.range(n_tiles):
-                t0 = t * RECV_TILE
-                flat_t0 = flat_base + t0
+            with pl.spmd(MM_GATE_BLOCKS, name_hint="exp_up_mm_tail"):
+                ub_idx = pl.tile.get_block_idx()
                 u_base = ub_idx * (MM_GATE_INNER * MM_INTER_TILE)
                 for ug in pl.range(MM_GATE_INNER):
                     u0 = u_base + ug * MM_INTER_TILE
