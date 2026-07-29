@@ -96,7 +96,7 @@ int main(int argc, char **argv)
     const size_t xBytes = static_cast<size_t>(kM * kK);
     const size_t weightBytes = PackedInt4Bytes(kExperts * kK * kW13N);
     const size_t weightScaleBytes =
-        static_cast<size_t>(kExperts * kW13N) * sizeof(float);
+        static_cast<size_t>(kExperts * kW13N) * sizeof(uint64_t);
     const size_t assistBytes = static_cast<size_t>(kExperts * kW13N) * sizeof(float);
     const size_t xScaleBytes = static_cast<size_t>(kM);
     const size_t groupListBytes = static_cast<size_t>(kExperts) * sizeof(int64_t);
@@ -112,7 +112,9 @@ int main(int argc, char **argv)
     void *outputDevice = DeviceAlloc(outputBytes);
     void *outputScaleDevice = DeviceAlloc(outputScaleBytes);
 
-    std::vector<float> weightScaleHost(static_cast<size_t>(kExperts * kW13N), 1.0F);
+    constexpr uint64_t kPackedUnitScales = 0x3F8000003F800000ULL;
+    std::vector<uint64_t> weightScaleHost(
+        static_cast<size_t>(kExperts * kW13N), kPackedUnitScales);
     std::vector<uint8_t> xScaleHost(static_cast<size_t>(kM), 127U);
     std::vector<int64_t> groupListHost(static_cast<size_t>(kExperts), kRowsPerExpert);
     CHECK_ACL(aclrtMemcpy(
@@ -141,7 +143,8 @@ int main(int argc, char **argv)
     std::vector<const aclTensor *> weightScaleItems;
     std::vector<const aclTensor *> assistItems;
     const size_t weightBytesPerExpert = PackedInt4Bytes(kK * kW13N);
-    const size_t weightScaleBytesPerExpert = static_cast<size_t>(kW13N) * sizeof(float);
+    const size_t weightScaleBytesPerExpert =
+        static_cast<size_t>(kW13N) * sizeof(uint64_t);
     const size_t assistBytesPerExpert = static_cast<size_t>(kW13N) * sizeof(float);
     for (int64_t expert = 0; expert < kExperts; ++expert) {
         aclTensor *weight = CreateTensor(
@@ -150,7 +153,7 @@ int main(int argc, char **argv)
             {kK / 64, kW13N / 16, 16, 64});
         aclTensor *weightScale = CreateTensor(
             static_cast<uint8_t *>(weightScaleDevice) + expert * weightScaleBytesPerExpert,
-            {kW13N}, ACL_FLOAT, ACL_FORMAT_ND);
+            {kW13N}, ACL_UINT64, ACL_FORMAT_ND);
         aclTensor *assist = CreateTensor(
             static_cast<uint8_t *>(assistDevice) + expert * assistBytesPerExpert, {kW13N},
             ACL_FLOAT, ACL_FORMAT_ND);
