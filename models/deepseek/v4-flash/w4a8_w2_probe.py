@@ -39,6 +39,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _KERNEL_DIR = Path(__file__).parent / "kernels" / "w4a8_w2"
 _ENTRY = _KERNEL_DIR / "entry.cpp"
 _TOPOLOGY_ENTRY = _KERNEL_DIR / "topology_entry.cpp"
+_CROSSCORE_ENTRY = _KERNEL_DIR / "crosscore_entry.cpp"
 _CATLASS_INCLUDE = _REPO_ROOT / "third_party" / "catlass" / "include"
 
 
@@ -88,6 +89,27 @@ def w4a8_w2_cce(
     dual_aiv_dispatch=True,
 )
 def mixed_topology_cce(topology: pl.Out[pl.Tensor]) -> pl.Tensor: ...
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_CROSSCORE_ENTRY,
+    aiv_source=_CROSSCORE_ENTRY,
+    include_dirs=_EXTERN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def crosscore_handshake_cce(handshake: pl.Out[pl.Tensor]) -> pl.Tensor: ...
+
+
+@pl.jit
+def crosscore_handshake_test(
+    handshake: pl.Out[pl.Tensor[[BLOCK_DIM * 3, 5], pl.INT32]],
+):
+    # Mirror one Catlass copy-ready/prologue-ready exchange without Resource,
+    # TPipe, data movement, INT4 conversion, or Cube work.
+    with pl.spmd(BLOCK_DIM, name_hint="crosscore_handshake", sync_start=True):
+        handshake = crosscore_handshake_cce(handshake)
+    return handshake
 
 
 @pl.jit
@@ -219,6 +241,36 @@ def build_topology_specs():
     ]
 
 
+def build_crosscore_specs():
+    import torch
+    from golden import TensorSpec
+
+    return [
+        TensorSpec(
+            "handshake",
+            [BLOCK_DIM * 3, 5],
+            torch.int32,
+            is_output=True,
+        ),
+    ]
+
+
+def golden_crosscore(tensors):
+    import torch
+
+    expected = torch.zeros(BLOCK_DIM * 3, 5, dtype=torch.int32)
+    for block_idx in range(BLOCK_DIM):
+        expected[block_idx] = torch.tensor(
+            [1, block_idx, -1, 1, 1], dtype=torch.int32
+        )
+        for lane in range(2):
+            row = BLOCK_DIM + block_idx * 2 + lane
+            expected[row] = torch.tensor(
+                [2, block_idx, lane, 1, 1], dtype=torch.int32
+            )
+    tensors["handshake"][:] = expected
+
+
 def golden_topology(tensors):
     import torch
 
@@ -277,7 +329,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--variant", choices=("w4a8", "int8", "topology"), required=True
+        "--variant",
+        choices=("w4a8", "int8", "topology", "crosscore"),
+        required=True,
     )
     parser.add_argument("-p", "--platform", default="a2a3", choices=("a2a3", "a2a3sim"))
     parser.add_argument("-d", "--device", type=int, default=0)
@@ -287,23 +341,30 @@ if __name__ == "__main__":
 
     is_w4 = args.variant == "w4a8"
     is_topology = args.variant == "topology"
+    is_crosscore = args.variant == "crosscore"
     result = run_jit(
         fn=(
-            mixed_topology_test
+            crosscore_handshake_test
+            if is_crosscore
+            else mixed_topology_test
             if is_topology
             else w4a8_w2_test
             if is_w4
             else int8_w2_test
         ),
         specs=(
-            build_topology_specs()
+            build_crosscore_specs()
+            if is_crosscore
+            else build_topology_specs()
             if is_topology
             else build_w4_specs()
             if is_w4
             else build_int8_specs()
         ),
         golden_fn=(
-            golden_topology
+            golden_crosscore
+            if is_crosscore
+            else golden_topology
             if is_topology
             else golden_w4
             if is_w4
