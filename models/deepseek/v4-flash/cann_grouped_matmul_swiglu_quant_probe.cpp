@@ -62,15 +62,18 @@ void *DeviceAlloc(size_t bytes)
 }
 
 aclTensor *CreateTensor(
-    void *data, const std::vector<int64_t> &dims, aclDataType dtype, aclFormat format)
+    void *data, const std::vector<int64_t> &dims, aclDataType dtype, aclFormat format,
+    const std::vector<int64_t> &storageDims = {})
 {
     std::vector<int64_t> strides(dims.size(), 1);
     for (int64_t i = static_cast<int64_t>(dims.size()) - 2; i >= 0; --i) {
         strides[static_cast<size_t>(i)] =
             strides[static_cast<size_t>(i + 1)] * dims[static_cast<size_t>(i + 1)];
     }
+    const std::vector<int64_t> &physicalDims = storageDims.empty() ? dims : storageDims;
     return aclCreateTensor(
-        dims.data(), dims.size(), dtype, strides.data(), 0, format, dims.data(), dims.size(), data);
+        dims.data(), dims.size(), dtype, strides.data(), 0, format, physicalDims.data(),
+        physicalDims.size(), data);
 }
 
 float Median(std::vector<float> values)
@@ -124,7 +127,9 @@ int main(int argc, char **argv)
 
     aclTensor *x = CreateTensor(xDevice, {kM, kK}, ACL_INT8, ACL_FORMAT_ND);
     aclTensor *weight =
-        CreateTensor(weightDevice, {kExperts, kK, kW13N}, ACL_INT4, ACL_FORMAT_FRACTAL_NZ);
+        CreateTensor(
+            weightDevice, {kExperts, kK, kW13N}, ACL_INT4, ACL_FORMAT_FRACTAL_NZ,
+            {kExperts, kK / 64, kW13N / 16, 16, 64});
     aclTensor *weightScale = CreateTensor(
         weightScaleDevice, {kExperts, kW13N, 2}, ACL_FLOAT, ACL_FORMAT_ND);
     aclTensor *assist =
