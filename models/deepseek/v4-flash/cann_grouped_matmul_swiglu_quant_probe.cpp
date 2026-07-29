@@ -18,9 +18,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -206,6 +208,8 @@ int main(int argc, char **argv)
     uint64_t workspaceBytes = 0;
     std::vector<float> measuredUs;
     measuredUs.reserve(kMeasured);
+    const std::vector<float> scaleSentinel(
+        static_cast<size_t>(kM), std::numeric_limits<float>::quiet_NaN());
 
     for (int run = 0; run < kWarmup + kMeasured; ++run) {
         uint64_t thisWorkspaceBytes = 0;
@@ -231,6 +235,12 @@ int main(int argc, char **argv)
         aclrtEvent end = nullptr;
         CHECK_ACL(aclrtCreateEvent(&start));
         CHECK_ACL(aclrtCreateEvent(&end));
+        if (nonzero) {
+            CHECK_ACL(aclrtMemset(outputDevice, outputBytes, 0x5A, outputBytes));
+            CHECK_ACL(aclrtMemcpy(
+                outputScaleDevice, outputScaleBytes, scaleSentinel.data(), outputScaleBytes,
+                ACL_MEMCPY_HOST_TO_DEVICE));
+        }
         CHECK_ACL(aclrtRecordEvent(start, stream));
         CHECK_ACL(aclnnGroupedMatmulSwigluQuantWeightNzV2(
             workspace, workspaceBytes, executor, stream));
@@ -277,6 +287,40 @@ int main(int argc, char **argv)
                       << " bad_scale_count=" << badScale
                       << " expected_scale=" << expectedScale
                       << " actual_scale0=" << outputScaleHost.front() << '\n';
+            for (int64_t row = 0; row < kM; ++row) {
+                const int8_t *rowBegin =
+                    outputHost.data() + static_cast<size_t>(row * kOutputN);
+                const int8_t *rowEnd = rowBegin + kOutputN;
+                const size_t rowBadQuant = static_cast<size_t>(
+                    std::count_if(rowBegin, rowEnd, [](int8_t value) {
+                        return value != 127;
+                    }));
+                const float scale = outputScaleHost[static_cast<size_t>(row)];
+                const bool rowBadScale =
+                    !std::isfinite(scale) ||
+                    std::abs(scale - expectedScale) > expectedScale * 0.002F;
+                if (rowBadQuant == 0 && !rowBadScale) {
+                    continue;
+                }
+                uint32_t scaleBits = 0;
+                std::memcpy(&scaleBits, &scale, sizeof(scaleBits));
+                const size_t sentinelCount = static_cast<size_t>(
+                    std::count(rowBegin, rowEnd, static_cast<int8_t>(0x5A)));
+                const size_t zeroCount =
+                    static_cast<size_t>(std::count(rowBegin, rowEnd, static_cast<int8_t>(0)));
+                const auto [minIt, maxIt] = std::minmax_element(rowBegin, rowEnd);
+                std::cerr << "bad_row=" << row << " expert=" << row / kRowsPerExpert
+                          << " local_row=" << row % kRowsPerExpert
+                          << " scale=" << scale << " scale_bits=0x" << std::hex
+                          << scaleBits << std::dec << " q_bad=" << rowBadQuant
+                          << " q_sentinel=" << sentinelCount << " q_zero=" << zeroCount
+                          << " q_min=" << static_cast<int>(*minIt)
+                          << " q_max=" << static_cast<int>(*maxIt) << " q_first8=";
+                for (int i = 0; i < 8; ++i) {
+                    std::cerr << (i == 0 ? "" : ",") << static_cast<int>(rowBegin[i]);
+                }
+                std::cerr << '\n';
+            }
             return 1;
         }
         std::cout << "correctness=PASS constant_nonzero_int4_nz"
