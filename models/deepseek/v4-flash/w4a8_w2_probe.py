@@ -260,12 +260,12 @@ def golden_crosscore(tensors):
 
     expected = torch.zeros(BLOCK_DIM * 3, 16, dtype=torch.int32)
     for block_idx in range(BLOCK_DIM):
-        expected[block_idx] = torch.tensor(
+        expected[block_idx, :5] = torch.tensor(
             [1, block_idx, -1, 1, 1], dtype=torch.int32
         )
         for lane in range(2):
             row = BLOCK_DIM + block_idx * 2 + lane
-            expected[row] = torch.tensor(
+            expected[row, :5] = torch.tensor(
                 [2, block_idx, lane, 1, 1], dtype=torch.int32
             )
     tensors["handshake"][:] = expected
