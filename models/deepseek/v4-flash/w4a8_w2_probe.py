@@ -711,7 +711,7 @@ def _batched_control_specs(weight, *, packed):
             [1],
             torch.int32,
             init_value=lambda: torch.tensor(
-                [BATCHED_EXPERTS], dtype=torch.int32
+                [BATCHED_ACTIVE_EXPERTS], dtype=torch.int32
             ),
         ),
         TensorSpec(
@@ -1490,7 +1490,7 @@ def compare_batched(actual, expected, **_):
 
 def golden_batched_w13_w4(tensors):
     tensors["out"].zero_()
-    for expert in range(BATCHED_EXPERTS):
+    for expert in range(BATCHED_ACTIVE_EXPERTS):
         weight = _unpack_int4_kn(tensors["weight_ekn"][expert])
         tensors["out"][expert] = _golden_matmul(
             tensors["activation"][expert], weight
@@ -1521,6 +1521,11 @@ if __name__ == "__main__":
         "--variant",
         choices=(
             "w13w4",
+            "w13w4g1",
+            "w13w4g2",
+            "w13w4g4",
+            "w13w4g8",
+            "w13w4g16",
             "w13int8",
             "batched",
             "batched1",
@@ -1550,9 +1555,15 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true")
     args = parser.parse_args()
 
-    is_w13_w4 = args.variant == "w13w4"
+    is_w13_w4 = args.variant.startswith("w13w4")
     is_w13_int8 = args.variant == "w13int8"
     is_batched = args.variant.startswith("batched")
+    if is_w13_w4:
+        BATCHED_ACTIVE_EXPERTS = (
+            BATCHED_EXPERTS
+            if args.variant == "w13w4"
+            else int(args.variant.split("g", 1)[1])
+        )
     if is_batched:
         BATCHED_ACTIVE_EXPERTS = (
             BATCHED_EXPERTS
