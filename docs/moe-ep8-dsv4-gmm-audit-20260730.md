@@ -115,3 +115,31 @@ Claude Code 审阅正常完成。OpenCode-DeepSeek 只调用一次并返回 HTTP
 - `artifacts/moe-dsv4-gmm-20260730/vllm_dsv4_gmm_cumulative_20260730.log`
 - 远端构建日志：
   `/data/sunkaixuan/skx_log_output/vllm_dsv4_gmm_build_20260730.log`
+
+## CANN 9.0.1 环境复查（2026-07-30）
+
+为确认该方向是否还能在 myserver 上继续，本轮只做了只读环境检查，没有提交
+新的 NPU 测试任务。
+
+检查结果：
+
+- `/usr/local/Ascend/cann` 只指向 `/usr/local/Ascend/cann-9.0.0`。
+- 已安装 OPP、runtime、PTO ISA 等组件的 `version.info` 均为 `9.0.0`。
+- `/usr/local/Ascend` 下没有第二套 CANN。
+- `/data/Ascend`、`/data/sunkaixuan` 和 `/opt` 下没有 CANN 9.0.1
+  安装目录、离线安装包或可复用环境。
+- 系统包、容器镜像和 modulefile 中也没有可用的 CANN 9.0.1。
+- 上游 vLLM-Ascend 当前 release 文档明确要求 CANN 9.0.1，其测试脚本也直接
+  使用 `/usr/local/Ascend/cann-9.0.1`。
+
+所以，当前阻塞不是缺少一次调参，而是缺少满足上游算子要求的底层运行环境。
+在 CANN 9.0.0 上继续修改 group list、ABI 或 tuning 参数，只会重复运行已知错误
+的路径，不能形成有效的性能证据。
+
+解除阻塞后只需重开一次严格验证：
+
+1. 隔离安装 CANN 9.0.1，保持当前 CANN 9.0.0 不变；
+2. 使用上游官方 Torch wrapper；
+3. 先要求 48/48 行写回、无 sentinel、量化与 scale 检查全部通过；
+4. 正确性通过后再测 2 次 warmup + 8 次正式数据；
+5. 融合 W13 中位数明显低于 `45.6 us` 后，才进入 EP8 端到端集成。
