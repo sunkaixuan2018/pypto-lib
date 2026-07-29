@@ -36,6 +36,7 @@ STAGES = 2
 WORKSPACE_BYTES = STAGES * L1_K * L1_N * BLOCK_DIM
 BATCHED_EXPERTS = 16
 BATCHED_ROWS = 16
+BATCHED_ACTIVE_EXPERTS = BATCHED_EXPERTS
 MARKER_ROWS = BLOCK_DIM * 3
 MARKER_COLUMNS = 16
 MARKER_BYTES = MARKER_ROWS * MARKER_COLUMNS * 4
@@ -117,6 +118,7 @@ def batched_w4a8_w2_cce(
     activation: pl.Tensor,
     packed_weight_ekn: pl.Tensor,
     workspace: pl.InOut[pl.Tensor],
+    active_experts: pl.Tensor,
 ) -> pl.Tensor: ...
 
 
@@ -281,6 +283,7 @@ def batched_w4a8_w2_test(
         [BATCHED_EXPERTS, K, N // 2], pl.INT8
     ],
     workspace: pl.Tensor[[WORKSPACE_BYTES], pl.INT8],
+    active_experts: pl.Tensor[[1], pl.INT32],
     out: pl.Out[
         pl.Tensor[[BATCHED_EXPERTS, BATCHED_ROWS, N], pl.INT32]
     ],
@@ -290,7 +293,7 @@ def batched_w4a8_w2_test(
     # reusing its private two-stage workspace.
     with pl.spmd(BLOCK_DIM, name_hint="batched_w4a8_w2", sync_start=True):
         out = batched_w4a8_w2_cce(
-            out, activation, packed_weight_ekn, workspace
+            out, activation, packed_weight_ekn, workspace, active_experts
         )
     return out
 
@@ -518,12 +521,12 @@ def build_batched_specs():
     from golden import TensorSpec
 
     torch.manual_seed(20260729)
-    expert = torch.arange(BATCHED_EXPERTS, dtype=torch.int16)[:, None]
-    row = torch.arange(BATCHED_ROWS, dtype=torch.int16)[None, :]
-    row_factor = (((3 * expert + 5 * row + 1) % 7) - 3).to(torch.int8)
-    activation = row_factor[:, :, None].expand(
-        BATCHED_EXPERTS, BATCHED_ROWS, K
-    ).contiguous()
+    activation = torch.randint(
+        -3,
+        4,
+        (BATCHED_EXPERTS, BATCHED_ROWS, K),
+        dtype=torch.int8,
+    )
 
     # Generating packed bytes directly avoids materializing a second 128 MiB
     # logical INT4 tensor on the host.  Every low/high nibble still spans the
@@ -554,6 +557,14 @@ def build_batched_specs():
             torch.int8,
             init_value=lambda: torch.zeros(
                 WORKSPACE_BYTES, dtype=torch.int8
+            ),
+        ),
+        TensorSpec(
+            "active_experts",
+            [1],
+            torch.int32,
+            init_value=lambda: torch.tensor(
+                [BATCHED_ACTIVE_EXPERTS], dtype=torch.int32
             ),
         ),
         TensorSpec(
@@ -1258,28 +1269,34 @@ def golden_w4(tensors):
 
 
 def golden_batched(tensors):
+    tensors["out"].zero_()
+    active_experts = int(tensors["active_experts"][0].item())
+    for expert in range(active_experts):
+        weight = _unpack_int4_kn(
+            tensors["packed_weight_ekn"][expert]
+        )
+        tensors["out"][expert] = _golden_matmul(
+            tensors["activation"][expert], weight
+        )
+
+
+def compare_batched(actual, expected, **_):
     import torch
 
-    packed = tensors["packed_weight_ekn"]
-    raw = packed.view(torch.uint8)
-
-    low = torch.bitwise_and(raw, 0xF).to(torch.int16)
-    low = torch.where(low < 8, low, low - 16)
-    low_sum = low.to(torch.int32).sum(dim=1)
-    del low
-
-    high = torch.bitwise_right_shift(raw, 4).to(torch.int16)
-    high = torch.where(high < 8, high, high - 16)
-    high_sum = high.to(torch.int32).sum(dim=1)
-    del high
-
-    weight_sum = torch.empty(
-        BATCHED_EXPERTS, N, dtype=torch.int32
-    )
-    weight_sum[:, 0::2] = low_sum
-    weight_sum[:, 1::2] = high_sum
-    row_factor = tensors["activation"][:, :, 0].to(torch.int32)
-    tensors["out"][:] = row_factor[:, :, None] * weight_sum[:, None, :]
+    active = BATCHED_ACTIVE_EXPERTS
+    actual_active = actual[:active].cpu()
+    expected_active = expected[:active].cpu()
+    if torch.equal(actual_active, expected_active):
+        return True, ""
+    mismatches = torch.nonzero(actual_active != expected_active)
+    details = []
+    for expert, row, column in mismatches[:16].tolist():
+        details.append(
+            f"[{expert},{row},{column}] "
+            f"actual={actual_active[expert, row, column].item()} "
+            f"expected={expected_active[expert, row, column].item()}"
+        )
+    return False, "batched active-output mismatch:\n" + "\n".join(details)
 
 
 def golden_int8(tensors):
@@ -1297,6 +1314,11 @@ if __name__ == "__main__":
         "--variant",
         choices=(
             "batched",
+            "batched1",
+            "batched2",
+            "batched4",
+            "batched8",
+            "batched16",
             "w4a8",
             "int8",
             "topology",
@@ -1319,7 +1341,13 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true")
     args = parser.parse_args()
 
-    is_batched = args.variant == "batched"
+    is_batched = args.variant.startswith("batched")
+    if is_batched:
+        BATCHED_ACTIVE_EXPERTS = (
+            BATCHED_EXPERTS
+            if args.variant == "batched"
+            else int(args.variant.removeprefix("batched"))
+        )
     is_w4 = args.variant == "w4a8"
     is_topology = args.variant == "topology"
     is_crosscore = args.variant == "crosscore"
@@ -1428,7 +1456,13 @@ if __name__ == "__main__":
         ),
         rtol=0.0,
         atol=0.0,
-        compare_fn={"topology": compare_topology} if is_topology else None,
+        compare_fn=(
+            {"topology": compare_topology}
+            if is_topology
+            else {"out": compare_batched}
+            if is_batched
+            else None
+        ),
     )
     if not result.passed:
         if result.error:

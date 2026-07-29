@@ -81,13 +81,12 @@ PyptoGetSubBlockNum() {
 
 namespace {
 
-constexpr uint32_t kExperts = 16;
+constexpr uint32_t kMaxExperts = 16;
 constexpr uint32_t kM = 16;
 constexpr uint32_t kK = 2048;
 constexpr uint32_t kN = 4096;
 constexpr uint32_t kNTile = 256;
 constexpr uint32_t kNTasks = kN / kNTile;
-constexpr uint32_t kTotalTasks = kExperts * kNTasks;
 constexpr uint32_t kStages = 2;
 constexpr uint32_t kKTile = 512;
 
@@ -158,11 +157,17 @@ using BlockMmad = Gemm::Block::BlockMmad<
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     // Signature order:
     //   0=out[E,M,N], 1=activation[E,M,K],
-    //   2=packed_weight[E,K,N/2], 3=workspace[block,stage,Ktile,Ntile].
+    //   2=packed_weight[E,K,N/2], 3=workspace[block,stage,Ktile,Ntile],
+    //   4=active_experts[1].
     const uint32_t block_idx =
         static_cast<uint32_t>(get_block_idx(args));
     const uint32_t block_num =
         static_cast<uint32_t>(get_block_num(args));
+    const uint32_t requested_experts =
+        static_cast<uint32_t>(*tensor_data<int32_t>(args, 4));
+    const uint32_t active_experts =
+        requested_experts < kMaxExperts ? requested_experts : kMaxExperts;
+    const uint32_t total_tasks = active_experts * kNTasks;
     set_catlass_runtime_topology(args);
 
     Arch::Resource<ArchTag> resource;
@@ -187,7 +192,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     AscendC::GlobalTensor<ElementC> out;
     out.SetGlobalBuffer(tensor_data<ElementC>(args, 0));
 
-    for (uint32_t task = block_idx; task < kTotalTasks;
+    for (uint32_t task = block_idx; task < total_tasks;
          task += block_num) {
         const uint32_t expert = task / kNTasks;
         const uint32_t n_task = task - expert * kNTasks;
@@ -214,7 +219,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     workspace.SetGlobalBuffer(
         tensor_data<ElementB>(args, 3) + workspace_offset);
 
-    for (uint32_t task = block_idx; task < kTotalTasks;
+    for (uint32_t task = block_idx; task < total_tasks;
          task += block_num) {
         const uint32_t expert = task / kNTasks;
         const uint32_t n_task = task - expert * kNTasks;
