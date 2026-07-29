@@ -217,8 +217,8 @@ int main(int argc, char **argv)
         CHECK_ACL(aclnnGroupedMatmulSwigluQuantWeightNzV2GetWorkspaceSize(
             x, weights, weightScales, assists, nullptr, xScale, nullptr, groupList,
             /*dequantMode=*/0, /*dequantDtype=*/0, /*quantMode=*/0,
-            /*groupListType=count=*/1, tuning, output, outputScale, &thisWorkspaceBytes,
-            &executor));
+            /*groupListType=count=*/1, tuning, /*swigluLimit=*/1.0e6, output,
+            outputScale, &thisWorkspaceBytes, &executor));
         if (run == 0) {
             workspaceBytes = thisWorkspaceBytes;
             if (workspaceBytes > 0) {
