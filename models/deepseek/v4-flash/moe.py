@@ -78,6 +78,9 @@ assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
 assert RECV_MAX == N_RANKS * MAX_PER_SRC
 
 
+_DISPATCH_WARMUP = __name__ == "__main__"
+
+
 @pl.jit.inline
 def clear_moe_signals(
     completion_anchor: pl.Tensor[[T, HC_MULT, D], pl.FP32],
@@ -132,12 +135,36 @@ def dispatch(
     # Meta and payload arrivals ride two independent windows (`arrived` /
     # `data_arrived`), so the two phases barrier separately and overlap freely.
 
+    arrived_expected = moe_epoch
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_warmup") as warmup_tid:
+        if _DISPATCH_WARMUP:
+            for peer in pl.range(N_RANKS):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=arrived,
+                        peer=peer,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(N_RANKS):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=arrived,
+                        offsets=[src, 0],
+                        expected=pl.cast(2 * moe_epoch - 1, pl.INT32),
+                        cmp=pld.WaitCmp.Ge,
+                    )
+    if _DISPATCH_WARMUP:
+        arrived_expected = pl.cast(2 * moe_epoch, pl.INT32)
+
     # Count routes, publish counts, barrier on meta, cumsum -> recv_count_out.
     # Needs every source's counts but none of the bulk payload.
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="dispatch_meta",
         allow_early_resolve=True,
+        deps=[warmup_tid],
     ) as _meta_tid:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
@@ -180,7 +207,7 @@ def dispatch(
                 pld.system.wait(
                     signal=arrived,
                     offsets=[src, 0],
-                    expected=moe_epoch,
+                    expected=arrived_expected,
                     cmp=pld.WaitCmp.Ge,
                 )
 
