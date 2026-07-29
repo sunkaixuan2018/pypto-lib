@@ -135,7 +135,10 @@ int main(int argc, char **argv)
     const float assistValue = nonzero ? 8.0F * static_cast<float>(kK) : 0.0F;
     std::vector<float> assistHost(static_cast<size_t>(kExperts * kW13N), assistValue);
     std::vector<float> xScaleHost(static_cast<size_t>(kM), 1.0F);
-    std::vector<int64_t> groupListHost(static_cast<size_t>(kExperts), kRowsPerExpert);
+    std::vector<int64_t> groupListHost(static_cast<size_t>(kExperts));
+    for (int64_t expert = 0; expert < kExperts; ++expert) {
+        groupListHost[static_cast<size_t>(expert)] = (expert + 1) * kRowsPerExpert;
+    }
     CHECK_ACL(aclrtMemcpy(
         weightScaleDevice, weightScaleBytes, weightScaleHost.data(), weightScaleBytes,
         ACL_MEMCPY_HOST_TO_DEVICE));
@@ -211,7 +214,7 @@ int main(int argc, char **argv)
         CHECK_ACL(aclnnGroupedMatmulSwigluQuantWeightNzV2GetWorkspaceSize(
             x, weights, weightScales, assists, nullptr, xScale, nullptr, groupList,
             /*dequantMode=*/0, /*dequantDtype=*/0, /*quantMode=*/0,
-            /*groupListType=count=*/1, tuning, /*swigluLimit=*/1.0e6, output,
+            /*groupListType=cumulative=*/0, tuning, /*swigluLimit=*/1.0e6, output,
             outputScale, &thisWorkspaceBytes, &executor));
         if (run == 0) {
             workspaceBytes = thisWorkspaceBytes;
