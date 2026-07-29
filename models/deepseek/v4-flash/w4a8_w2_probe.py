@@ -43,6 +43,8 @@ AIC_MMAD_K = 1024
 AIC_MMAD_WORKSPACE_BYTES = BLOCK_DIM * STAGES * L1_K * L1_N
 AIC_MMAD_OUTPUT_BYTES = MARKER_BYTES + M * N * 4
 DYNAMIC_MMAD_OUTPUT_BYTES = MARKER_BYTES + M * N * 4
+INTEGRATED_K = 1024
+INTEGRATED_OUTPUT_BYTES = MARKER_BYTES + M * N * 4
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _KERNEL_DIR = Path(__file__).parent / "kernels" / "w4a8_w2"
@@ -55,6 +57,7 @@ _PINGPONG_ENTRY = _KERNEL_DIR / "pingpong_entry.cpp"
 _TILECAST_ENTRY = _KERNEL_DIR / "tilecast_entry.cpp"
 _AIC_MMAD_ENTRY = _KERNEL_DIR / "aic_mmad_entry.cpp"
 _DYNAMIC_MMAD_ENTRY = _KERNEL_DIR / "dynamic_mmad_entry.cpp"
+_INTEGRATED_ENTRY = _KERNEL_DIR / "integrated_k1024_entry.cpp"
 _CATLASS_INCLUDE = _REPO_ROOT / "third_party" / "catlass" / "include"
 
 
@@ -186,6 +189,37 @@ def dynamic_int8_mmad_cce(
     weight_kn: pl.Tensor,
     workspace: pl.InOut[pl.Tensor],
 ) -> pl.Tensor: ...
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_INTEGRATED_ENTRY,
+    aiv_source=_INTEGRATED_ENTRY,
+    include_dirs=_EXTERN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def integrated_k1024_cce(
+    output: pl.Out[pl.Tensor],
+    activation: pl.Tensor,
+    packed_weight_kn: pl.Tensor,
+    workspace: pl.InOut[pl.Tensor],
+) -> pl.Tensor: ...
+
+
+@pl.jit
+def integrated_k1024_test(
+    activation: pl.Tensor[[M, INTEGRATED_K], pl.INT8],
+    packed_weight_kn: pl.Tensor[[INTEGRATED_K, N // 2], pl.INT8],
+    workspace: pl.Tensor[[WORKSPACE_BYTES], pl.INT8],
+    output: pl.Out[pl.Tensor[[INTEGRATED_OUTPUT_BYTES], pl.INT8]],
+):
+    # Exactly two stages combine the stock packed-INT4 TileCast prologue with
+    # the real AIC consumer, without introducing a workspace slot wraparound.
+    with pl.spmd(BLOCK_DIM, name_hint="integrated_k1024", sync_start=True):
+        output = integrated_k1024_cce(
+            output, activation, packed_weight_kn, workspace
+        )
+    return output
 
 
 @pl.jit
@@ -341,7 +375,7 @@ def _unpack_int4_kn(packed):
     high = (raw >> 4) & 0xF
     low = torch.where(low < 8, low, low - 16)
     high = torch.where(high < 8, high, high - 16)
-    weight = torch.empty(K, N, dtype=torch.int8)
+    weight = torch.empty(packed.shape[0], N, dtype=torch.int8)
     weight[:, 0::2] = low.to(torch.int8)
     weight[:, 1::2] = high.to(torch.int8)
     return weight
@@ -582,6 +616,69 @@ def build_dynamic_mmad_specs():
             is_output=True,
         ),
     ]
+
+
+def build_integrated_specs():
+    import torch
+    from golden import TensorSpec
+
+    activation, weight = _aic_mmad_inputs()
+    packed = _pack_int4_kn(weight)
+    return [
+        TensorSpec(
+            "activation",
+            [M, INTEGRATED_K],
+            torch.int8,
+            init_value=lambda: activation,
+        ),
+        TensorSpec(
+            "integrated_packed_weight_kn",
+            [INTEGRATED_K, N // 2],
+            torch.int8,
+            init_value=lambda: packed,
+        ),
+        TensorSpec(
+            "integrated_workspace",
+            [WORKSPACE_BYTES],
+            torch.int8,
+            init_value=lambda: torch.zeros(
+                WORKSPACE_BYTES, dtype=torch.int8
+            ),
+        ),
+        TensorSpec(
+            "integrated_output",
+            [INTEGRATED_OUTPUT_BYTES],
+            torch.int8,
+            is_output=True,
+        ),
+    ]
+
+
+def golden_integrated(tensors):
+    import torch
+
+    output = tensors["integrated_output"]
+    output.zero_()
+    marker = output[:MARKER_BYTES].view(torch.int32).reshape(
+        MARKER_ROWS, MARKER_COLUMNS
+    )
+    for block_idx in range(BLOCK_DIM):
+        active = block_idx < 16
+        marker[block_idx, :9] = torch.tensor(
+            [1, block_idx, -1, 1, 1, 1, int(active), 1, 0],
+            dtype=torch.int32,
+        )
+        for lane in range(2):
+            row = BLOCK_DIM + block_idx * 2 + lane
+            marker[row, :9] = torch.tensor(
+                [2, block_idx, lane, 1, 1, 1, int(active), 1, 0],
+                dtype=torch.int32,
+            )
+    matrix_out = output[MARKER_BYTES:].view(torch.int32).reshape(M, N)
+    matrix_out[:] = _golden_matmul(
+        tensors["activation"],
+        _unpack_int4_kn(tensors["integrated_packed_weight_kn"]),
+    )
 
 
 def golden_dynamic_mmad(tensors):
@@ -886,6 +983,7 @@ if __name__ == "__main__":
             "tilecast",
             "aicmmad",
             "dynamicmmad",
+            "integrated1024",
         ),
         required=True,
     )
@@ -904,9 +1002,12 @@ if __name__ == "__main__":
     is_tilecast = args.variant == "tilecast"
     is_aicmmad = args.variant == "aicmmad"
     is_dynamicmmad = args.variant == "dynamicmmad"
+    is_integrated = args.variant == "integrated1024"
     result = run_jit(
         fn=(
-            dynamic_int8_mmad_test
+            integrated_k1024_test
+            if is_integrated
+            else dynamic_int8_mmad_test
             if is_dynamicmmad
             else aic_workspace_mmad_test
             if is_aicmmad
@@ -927,7 +1028,9 @@ if __name__ == "__main__":
             else int8_w2_test
         ),
         specs=(
-            build_dynamic_mmad_specs()
+            build_integrated_specs()
+            if is_integrated
+            else build_dynamic_mmad_specs()
             if is_dynamicmmad
             else build_aic_mmad_specs()
             if is_aicmmad
@@ -948,7 +1051,9 @@ if __name__ == "__main__":
             else build_int8_specs()
         ),
         golden_fn=(
-            golden_dynamic_mmad
+            golden_integrated
+            if is_integrated
+            else golden_dynamic_mmad
             if is_dynamicmmad
             else golden_aic_mmad
             if is_aicmmad
