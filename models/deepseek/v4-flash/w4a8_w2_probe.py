@@ -37,6 +37,8 @@ WORKSPACE_BYTES = STAGES * L1_K * L1_N * BLOCK_DIM
 BATCHED_EXPERTS = 16
 BATCHED_ROWS = 16
 BATCHED_ACTIVE_EXPERTS = BATCHED_EXPERTS
+W13_K = 4096
+W13_N = 4096
 MARKER_ROWS = BLOCK_DIM * 3
 MARKER_COLUMNS = 16
 MARKER_BYTES = MARKER_ROWS * MARKER_COLUMNS * 4
@@ -119,6 +121,8 @@ def batched_w4a8_w2_cce(
     packed_weight_ekn: pl.Tensor,
     workspace: pl.InOut[pl.Tensor],
     active_experts: pl.Tensor,
+    problem_k: pl.Tensor,
+    weight_format: pl.Tensor,
 ) -> pl.Tensor: ...
 
 
@@ -284,6 +288,8 @@ def batched_w4a8_w2_test(
     ],
     workspace: pl.Tensor[[WORKSPACE_BYTES], pl.INT8],
     active_experts: pl.Tensor[[1], pl.INT32],
+    problem_k: pl.Tensor[[1], pl.INT32],
+    weight_format: pl.Tensor[[1], pl.INT32],
     out: pl.Out[
         pl.Tensor[[BATCHED_EXPERTS, BATCHED_ROWS, N], pl.INT32]
     ],
@@ -293,7 +299,77 @@ def batched_w4a8_w2_test(
     # reusing its private two-stage workspace.
     with pl.spmd(BLOCK_DIM, name_hint="batched_w4a8_w2", sync_start=True):
         out = batched_w4a8_w2_cce(
-            out, activation, packed_weight_ekn, workspace, active_experts
+            out,
+            activation,
+            packed_weight_ekn,
+            workspace,
+            active_experts,
+            problem_k,
+            weight_format,
+        )
+    return out
+
+
+@pl.jit
+def batched_w13_w4_test(
+    activation: pl.Tensor[
+        [BATCHED_EXPERTS, BATCHED_ROWS, W13_K], pl.INT8
+    ],
+    weight_ekn: pl.Tensor[
+        [BATCHED_EXPERTS, W13_K, W13_N // 2], pl.INT8
+    ],
+    workspace: pl.Tensor[[WORKSPACE_BYTES], pl.INT8],
+    active_experts: pl.Tensor[[1], pl.INT32],
+    problem_k: pl.Tensor[[1], pl.INT32],
+    weight_format: pl.Tensor[[1], pl.INT32],
+    out: pl.Out[
+        pl.Tensor[
+            [BATCHED_EXPERTS, BATCHED_ROWS, W13_N], pl.INT32
+        ]
+    ],
+):
+    with pl.spmd(BLOCK_DIM, name_hint="batched_w13_w4", sync_start=True):
+        out = batched_w4a8_w2_cce(
+            out,
+            activation,
+            weight_ekn,
+            workspace,
+            active_experts,
+            problem_k,
+            weight_format,
+        )
+    return out
+
+
+@pl.jit
+def batched_w13_int8_test(
+    activation: pl.Tensor[
+        [BATCHED_EXPERTS, BATCHED_ROWS, W13_K], pl.INT8
+    ],
+    weight_ekn: pl.Tensor[
+        [BATCHED_EXPERTS, W13_K, W13_N], pl.INT8
+    ],
+    workspace: pl.Tensor[[WORKSPACE_BYTES], pl.INT8],
+    active_experts: pl.Tensor[[1], pl.INT32],
+    problem_k: pl.Tensor[[1], pl.INT32],
+    weight_format: pl.Tensor[[1], pl.INT32],
+    out: pl.Out[
+        pl.Tensor[
+            [BATCHED_EXPERTS, BATCHED_ROWS, W13_N], pl.INT32
+        ]
+    ],
+):
+    with pl.spmd(
+        BLOCK_DIM, name_hint="batched_w13_int8", sync_start=True
+    ):
+        out = batched_w4a8_w2_cce(
+            out,
+            activation,
+            weight_ekn,
+            workspace,
+            active_experts,
+            problem_k,
+            weight_format,
         )
     return out
 
@@ -568,12 +644,125 @@ def build_batched_specs():
             ),
         ),
         TensorSpec(
+            "problem_k",
+            [1],
+            torch.int32,
+            init_value=lambda: torch.tensor([K], dtype=torch.int32),
+        ),
+        TensorSpec(
+            "weight_format",
+            [1],
+            torch.int32,
+            init_value=lambda: torch.tensor([0], dtype=torch.int32),
+        ),
+        TensorSpec(
             "out",
             [BATCHED_EXPERTS, BATCHED_ROWS, N],
             torch.int32,
             is_output=True,
         ),
     ]
+
+
+def _batched_w13_activation():
+    import torch
+
+    torch.manual_seed(20260729)
+    return torch.randint(
+        -3,
+        4,
+        (BATCHED_EXPERTS, BATCHED_ROWS, W13_K),
+        dtype=torch.int8,
+    )
+
+
+def _batched_control_specs(weight, *, packed):
+    import torch
+    from golden import TensorSpec
+
+    weight_shape = [
+        BATCHED_EXPERTS,
+        W13_K,
+        W13_N // 2 if packed else W13_N,
+    ]
+    return [
+        TensorSpec(
+            "activation",
+            [BATCHED_EXPERTS, BATCHED_ROWS, W13_K],
+            torch.int8,
+            init_value=_batched_w13_activation,
+        ),
+        TensorSpec(
+            "weight_ekn",
+            weight_shape,
+            torch.int8,
+            init_value=lambda: weight,
+        ),
+        TensorSpec(
+            "workspace",
+            [WORKSPACE_BYTES],
+            torch.int8,
+            init_value=lambda: torch.zeros(
+                WORKSPACE_BYTES, dtype=torch.int8
+            ),
+        ),
+        TensorSpec(
+            "active_experts",
+            [1],
+            torch.int32,
+            init_value=lambda: torch.tensor(
+                [BATCHED_EXPERTS], dtype=torch.int32
+            ),
+        ),
+        TensorSpec(
+            "problem_k",
+            [1],
+            torch.int32,
+            init_value=lambda: torch.tensor(
+                [W13_K], dtype=torch.int32
+            ),
+        ),
+        TensorSpec(
+            "weight_format",
+            [1],
+            torch.int32,
+            init_value=lambda: torch.tensor(
+                [0 if packed else 1], dtype=torch.int32
+            ),
+        ),
+        TensorSpec(
+            "out",
+            [BATCHED_EXPERTS, BATCHED_ROWS, W13_N],
+            torch.int32,
+            is_output=True,
+        ),
+    ]
+
+
+def build_batched_w13_w4_specs():
+    import torch
+
+    torch.manual_seed(20260730)
+    packed = torch.randint(
+        0,
+        256,
+        (BATCHED_EXPERTS, W13_K, W13_N // 2),
+        dtype=torch.uint8,
+    ).view(torch.int8)
+    return _batched_control_specs(packed, packed=True)
+
+
+def build_batched_w13_int8_specs():
+    import torch
+
+    torch.manual_seed(20260730)
+    weight = torch.randint(
+        -8,
+        8,
+        (BATCHED_EXPERTS, W13_K, W13_N),
+        dtype=torch.int8,
+    )
+    return _batched_control_specs(weight, packed=False)
 
 
 def build_int8_specs():
@@ -1299,6 +1488,24 @@ def compare_batched(actual, expected, **_):
     return False, "batched active-output mismatch:\n" + "\n".join(details)
 
 
+def golden_batched_w13_w4(tensors):
+    tensors["out"].zero_()
+    for expert in range(BATCHED_EXPERTS):
+        weight = _unpack_int4_kn(tensors["weight_ekn"][expert])
+        tensors["out"][expert] = _golden_matmul(
+            tensors["activation"][expert], weight
+        )
+
+
+def golden_batched_w13_int8(tensors):
+    tensors["out"].zero_()
+    for expert in range(BATCHED_EXPERTS):
+        tensors["out"][expert] = _golden_matmul(
+            tensors["activation"][expert],
+            tensors["weight_ekn"][expert],
+        )
+
+
 def golden_int8(tensors):
     tensors["out"][:] = _golden_matmul(
         tensors["activation"], tensors["weight_nk"].T.contiguous()
@@ -1313,6 +1520,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--variant",
         choices=(
+            "w13w4",
+            "w13int8",
             "batched",
             "batched1",
             "batched2",
@@ -1341,6 +1550,8 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true")
     args = parser.parse_args()
 
+    is_w13_w4 = args.variant == "w13w4"
+    is_w13_int8 = args.variant == "w13int8"
     is_batched = args.variant.startswith("batched")
     if is_batched:
         BATCHED_ACTIVE_EXPERTS = (
@@ -1362,7 +1573,11 @@ if __name__ == "__main__":
     is_integrated_full = args.variant == "integrated2048"
     result = run_jit(
         fn=(
-            batched_w4a8_w2_test
+            batched_w13_w4_test
+            if is_w13_w4
+            else batched_w13_int8_test
+            if is_w13_int8
+            else batched_w4a8_w2_test
             if is_batched
             else integrated_k2048_test
             if is_integrated_full
@@ -1391,7 +1606,11 @@ if __name__ == "__main__":
             else int8_w2_test
         ),
         specs=(
-            build_batched_specs()
+            build_batched_w13_w4_specs()
+            if is_w13_w4
+            else build_batched_w13_int8_specs()
+            if is_w13_int8
+            else build_batched_specs()
             if is_batched
             else build_integrated_full_specs()
             if is_integrated_full
@@ -1420,7 +1639,11 @@ if __name__ == "__main__":
             else build_int8_specs()
         ),
         golden_fn=(
-            golden_batched
+            golden_batched_w13_w4
+            if is_w13_w4
+            else golden_batched_w13_int8
+            if is_w13_int8
+            else golden_batched
             if is_batched
             else golden_integrated_full
             if is_integrated_full
@@ -1460,7 +1683,7 @@ if __name__ == "__main__":
             {"topology": compare_topology}
             if is_topology
             else {"out": compare_batched}
-            if is_batched
+            if is_batched or is_w13_w4 or is_w13_int8
             else None
         ),
     )

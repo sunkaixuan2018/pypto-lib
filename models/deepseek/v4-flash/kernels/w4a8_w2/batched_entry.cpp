@@ -83,12 +83,14 @@ namespace {
 
 constexpr uint32_t kMaxExperts = 16;
 constexpr uint32_t kM = 16;
-constexpr uint32_t kK = 2048;
 constexpr uint32_t kN = 4096;
 constexpr uint32_t kNTile = 256;
 constexpr uint32_t kNTasks = kN / kNTile;
 constexpr uint32_t kStages = 2;
 constexpr uint32_t kKTile = 512;
+constexpr uint16_t kCopyFlags[kStages] = {0, 2};
+constexpr uint16_t kPrologueFlags[kStages] = {1, 3};
+constexpr event_t kProducerEvent = EVENT_ID2;
 
 template <typename T>
 static __aicore__ __attribute__((always_inline)) __gm__ T *
@@ -158,7 +160,8 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     // Signature order:
     //   0=out[E,M,N], 1=activation[E,M,K],
     //   2=packed_weight[E,K,N/2], 3=workspace[block,stage,Ktile,Ntile],
-    //   4=active_experts[1].
+    //   4=active_experts[1], 5=problem_k[1],
+    //   6=weight_format[1] (0=packed INT4, 1=expanded INT8).
     const uint32_t block_idx =
         static_cast<uint32_t>(get_block_idx(args));
     const uint32_t block_num =
@@ -167,6 +170,10 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         static_cast<uint32_t>(*tensor_data<int32_t>(args, 4));
     const uint32_t active_experts =
         requested_experts < kMaxExperts ? requested_experts : kMaxExperts;
+    const uint32_t problem_k =
+        static_cast<uint32_t>(*tensor_data<int32_t>(args, 5));
+    const uint32_t weight_format =
+        static_cast<uint32_t>(*tensor_data<int32_t>(args, 6));
     const uint32_t total_tasks = active_experts * kNTasks;
     set_catlass_runtime_topology(args);
 
@@ -174,11 +181,11 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     BlockMmad::Params params{};
     BlockMmad block_mmad(resource, params);
 
-    const LayoutA layout_a{kM, kK};
-    const LayoutPrologueB layout_packed{kK, kN, kN};
+    const LayoutA layout_a{kM, problem_k};
+    const LayoutPrologueB layout_packed{problem_k, kN, kN};
     const LayoutB layout_workspace{kKTile, kNTile};
     const LayoutC layout_c{kM, kN, kN};
-    const GemmCoord task_shape{kM, kNTile, kK};
+    const GemmCoord task_shape{kM, kNTile, problem_k};
 
     const uint64_t workspace_offset =
         static_cast<uint64_t>(block_idx) * kStages * kKTile * kNTile;
@@ -199,7 +206,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         const uint32_t n0 = n_task * kNTile;
 
         auto task_a = activation[
-            static_cast<uint64_t>(expert) * kM * kK];
+            static_cast<uint64_t>(expert) * kM * problem_k];
         auto task_c = out[
             static_cast<uint64_t>(expert) * kM * kN + n0];
         auto task_c_layout =
@@ -218,22 +225,73 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     AscendC::GlobalTensor<ElementB> workspace;
     workspace.SetGlobalBuffer(
         tensor_data<ElementB>(args, 3) + workspace_offset);
+    AscendC::GlobalTensor<int8_t> expanded_weight;
+    expanded_weight.SetGlobalBuffer(tensor_data<int8_t>(args, 2));
+    auto ub = resource.ubBuf.template GetBufferByByte<int8_t>(0);
+
+    AscendC::DataCopyExtParams input_copy(
+        kNTile, kNTile, kN - kNTile, 0, 0);
+    AscendC::DataCopyPadExtParams<int8_t> input_pad(
+        false, 0, 0, 0);
+    AscendC::DataCopyExtParams output_copy(
+        kNTile, kNTile, 0, 0, 0);
 
     for (uint32_t task = block_idx; task < total_tasks;
          task += block_num) {
         const uint32_t expert = task / kNTasks;
         const uint32_t n_task = task - expert * kNTasks;
         const uint32_t n0 = n_task * kNTile;
-        const uint64_t packed_offset =
-            static_cast<uint64_t>(expert) * kK * kN +
-            layout_packed.GetOffset(MatrixCoord{0, n0});
-        auto task_packed = packed_weight[packed_offset];
-        auto task_packed_layout =
-            layout_packed.GetTileLayout(MatrixCoord{kK, kNTile});
-        block_mmad.Prologue(
-            task_packed, task_packed_layout,
-            workspace, layout_workspace,
-            task_shape);
+        if (weight_format == 0) {
+            const uint64_t packed_offset =
+                static_cast<uint64_t>(expert) * problem_k * kN +
+                layout_packed.GetOffset(MatrixCoord{0, n0});
+            auto task_packed = packed_weight[packed_offset];
+            auto task_packed_layout =
+                layout_packed.GetTileLayout(
+                    MatrixCoord{problem_k, kNTile});
+            block_mmad.Prologue(
+                task_packed, task_packed_layout,
+                workspace, layout_workspace,
+                task_shape);
+        } else {
+            const uint32_t lane =
+                static_cast<uint32_t>(get_sub_block_id(args));
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(
+                kProducerEvent);
+            for (uint32_t k0 = 0; k0 < problem_k; k0 += kKTile) {
+                const uint32_t stage = (k0 / kKTile) & 1U;
+                AscendC::CrossCoreWaitFlag(kCopyFlags[stage]);
+                AscendC::WaitFlag<
+                    AscendC::HardEvent::MTE3_MTE2>(kProducerEvent);
+                const uint64_t source_offset =
+                    static_cast<uint64_t>(expert) * problem_k * kN +
+                    static_cast<uint64_t>(k0 + lane * 256) * kN +
+                    n0;
+                AscendC::DataCopyPad(
+                    ub, expanded_weight[source_offset],
+                    input_copy, input_pad);
+                AscendC::SetFlag<
+                    AscendC::HardEvent::MTE2_V>(kProducerEvent);
+                AscendC::WaitFlag<
+                    AscendC::HardEvent::MTE2_V>(kProducerEvent);
+                AscendC::SetFlag<
+                    AscendC::HardEvent::V_MTE3>(kProducerEvent);
+                AscendC::WaitFlag<
+                    AscendC::HardEvent::V_MTE3>(kProducerEvent);
+                const uint64_t stage_offset =
+                    static_cast<uint64_t>(stage) *
+                        kKTile * kNTile +
+                    lane * 256 * kNTile;
+                AscendC::DataCopyPad(
+                    workspace[stage_offset], ub, output_copy);
+                AscendC::CrossCoreSetFlag<0x02, PIPE_MTE3>(
+                    kPrologueFlags[stage]);
+                AscendC::SetFlag<
+                    AscendC::HardEvent::MTE3_MTE2>(kProducerEvent);
+            }
+            AscendC::WaitFlag<
+                AscendC::HardEvent::MTE3_MTE2>(kProducerEvent);
+        }
     }
 #endif
 }
