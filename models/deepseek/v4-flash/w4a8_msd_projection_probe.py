@@ -99,15 +99,19 @@ def w2_i4_msd_cce(
 ) -> pl.Tensor: ...
 
 
-@pl.jit.inline
-def _reconstruct(
-    acc_planes: pl.Tensor,
-    sum_weight: pl.Tensor,
-    out: pl.Tensor,
-    n: int,
-    blocks: int,
+@pl.jit
+def gate_msd_packed(
+    packed_planes: pl.Tensor[[PLANES_M, GATE_K // 2], pl.INT8],
+    packed_weight: pl.Tensor[[GATE_N, GATE_K // 2], pl.INT8],
+    sum_weight: pl.Tensor[[GATE_N], pl.INT32],
+    out: pl.Out[pl.Tensor[[M, GATE_N], pl.INT32]],
 ):
-    with pl.spmd(blocks, name_hint="msd_reconstruct"):
+    acc_planes = pl.create_tensor([PLANES_M, GATE_N], dtype=pl.INT32)
+    with pl.spmd(GATE_BLOCKS, name_hint="gate_i4_msd"):
+        acc_planes = gate_i4_msd_cce(
+            acc_planes, packed_planes, packed_weight
+        )
+    with pl.spmd(GATE_BLOCKS, name_hint="gate_msd_reconstruct"):
         block_idx = pl.tile.get_block_idx()
         n_base = block_idx * INNER * N_TILE
         for inner in pl.range(INNER):
@@ -122,21 +126,6 @@ def _reconstruct(
             out[:, n0:n0 + N_TILE] = pl.col_expand_add(
                 combined, assist
             )
-
-
-@pl.jit
-def gate_msd_packed(
-    packed_planes: pl.Tensor[[PLANES_M, GATE_K // 2], pl.INT8],
-    packed_weight: pl.Tensor[[GATE_N, GATE_K // 2], pl.INT8],
-    sum_weight: pl.Tensor[[GATE_N], pl.INT32],
-    out: pl.Out[pl.Tensor[[M, GATE_N], pl.INT32]],
-):
-    acc_planes = pl.create_tensor([PLANES_M, GATE_N], dtype=pl.INT32)
-    with pl.spmd(GATE_BLOCKS, name_hint="gate_i4_msd"):
-        acc_planes = gate_i4_msd_cce(
-            acc_planes, packed_planes, packed_weight
-        )
-    _reconstruct(acc_planes, sum_weight, out, GATE_N, GATE_BLOCKS)
     return out
 
 
@@ -152,7 +141,21 @@ def w2_msd_packed(
         acc_planes = w2_i4_msd_cce(
             acc_planes, packed_planes, packed_weight
         )
-    _reconstruct(acc_planes, sum_weight, out, W2_N, W2_BLOCKS)
+    with pl.spmd(W2_BLOCKS, name_hint="w2_msd_reconstruct"):
+        block_idx = pl.tile.get_block_idx()
+        n_base = block_idx * INNER * N_TILE
+        for inner in pl.range(INNER):
+            n0 = n_base + inner * N_TILE
+            acc_hi = acc_planes[0:M, n0:n0 + N_TILE]
+            acc_lo = acc_planes[M:PLANES_M, n0:n0 + N_TILE]
+            combined = pl.add(pl.mul(acc_hi, 16), acc_lo)
+            assist = pl.mul(
+                pl.reshape(sum_weight[n0:n0 + N_TILE], [1, N_TILE]),
+                8,
+            )
+            out[:, n0:n0 + N_TILE] = pl.col_expand_add(
+                combined, assist
+            )
     return out
 
 
