@@ -103,7 +103,7 @@ def crosscore_handshake_cce(handshake: pl.Out[pl.Tensor]) -> pl.Tensor: ...
 
 @pl.jit
 def crosscore_handshake_test(
-    handshake: pl.Out[pl.Tensor[[BLOCK_DIM * 3, 5], pl.INT32]],
+    handshake: pl.Out[pl.Tensor[[BLOCK_DIM * 3, 16], pl.INT32]],
 ):
     # Mirror one Catlass copy-ready/prologue-ready exchange without Resource,
     # TPipe, data movement, INT4 conversion, or Cube work.
@@ -248,7 +248,7 @@ def build_crosscore_specs():
     return [
         TensorSpec(
             "handshake",
-            [BLOCK_DIM * 3, 5],
+            [BLOCK_DIM * 3, 16],
             torch.int32,
             is_output=True,
         ),
@@ -258,7 +258,7 @@ def build_crosscore_specs():
 def golden_crosscore(tensors):
     import torch
 
-    expected = torch.zeros(BLOCK_DIM * 3, 5, dtype=torch.int32)
+    expected = torch.zeros(BLOCK_DIM * 3, 16, dtype=torch.int32)
     for block_idx in range(BLOCK_DIM):
         expected[block_idx] = torch.tensor(
             [1, block_idx, -1, 1, 1], dtype=torch.int32

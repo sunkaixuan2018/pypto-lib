@@ -31,7 +31,10 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) { (void)args; }
 namespace {
 
 constexpr uint32_t kBlockDim = 24;
-constexpr uint32_t kColumns = 5;
+// CACHELINE_OUT writes a complete 64-byte A3 data-cache line.  Give every
+// physical engine its own line so one core cannot write back a stale copy of
+// another core's before/after fields.
+constexpr uint32_t kColumns = 16;
 constexpr uint16_t kCopyReady = 0;
 constexpr uint16_t kPrologueReady = 1;
 
@@ -63,6 +66,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     row[1] = static_cast<int32_t>(block_idx);
     row[2] = -1;
     row[3] = 1;
+    row[4] = 0;
+    row[5] = static_cast<int32_t>(
+        reinterpret_cast<uint64_t>(handshake) & 63U);
+    for (uint32_t column = 6; column < kColumns; ++column) {
+        row[column] = 0;
+    }
     flush_row(row);
 
     // Stock Catlass broadcasts one copy-ready flag to both AIV lanes, then
@@ -81,6 +90,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     row[1] = static_cast<int32_t>(block_idx);
     row[2] = static_cast<int32_t>(lane);
     row[3] = 1;
+    row[4] = 0;
+    row[5] = static_cast<int32_t>(
+        reinterpret_cast<uint64_t>(handshake) & 63U);
+    for (uint32_t column = 6; column < kColumns; ++column) {
+        row[column] = 0;
+    }
     flush_row(row);
 
     AscendC::CrossCoreWaitFlag(kCopyReady);
