@@ -39,7 +39,7 @@ MM_GATE_INNER = 4
 ACT_INTER_TILE = 128
 ACT_GATE_INNER = 4
 ACT_ROW_PAD = 8
-ACT_ROWS_PER_BLOCK = 8
+ACT_ROWS_PER_BLOCK = 2
 D_OUT_TILE = 256
 # h_tile_i8 store innermost = QUANT_TILE bytes (int8); 512 hits the a2a3 L2 cache
 # line (perf_hint PH001 flagged the prior 256B store as sub-line).
@@ -149,7 +149,10 @@ def expert_routed(
                 [RECV_TILE, MOE_INTER], dtype=pl.INT8, init_value=0
             )
             h_tile_scale_dq = pl.create_tensor(
-                [RECV_TILE, 1], dtype=pl.FP32, init_value=0.0, manual_dep=True
+                [RECV_TILE, ACT_ROW_PAD],
+                dtype=pl.FP32,
+                init_value=0.0,
+                manual_dep=True,
             )
             active_row_blocks = (
                 valid_rows + ACT_ROWS_PER_BLOCK - 1
@@ -253,9 +256,17 @@ def expert_routed(
                 row_scale_dq_col = pl.reshape(
                     pl.recip(row_scale_q), [ACT_ROW_PAD, 1]
                 )
+                row_scale_dq = pl.row_expand(
+                    pl.full(
+                        [ACT_ROW_PAD, ACT_ROW_PAD],
+                        dtype=pl.FP32,
+                        value=0.0,
+                    ),
+                    row_scale_dq_col,
+                )
                 h_tile_scale_dq[
                     row0 : row0 + ACT_ROWS_PER_BLOCK, :
-                ] = row_scale_dq_col[0:ACT_ROWS_PER_BLOCK, :]
+                ] = row_scale_dq[0:ACT_ROWS_PER_BLOCK, :]
                 for q_idx in pl.pipeline(
                     0, MOE_INTER // QUANT_TILE, stage=1
                 ):
@@ -314,7 +325,10 @@ def expert_routed(
                     recv_weights[local_e : local_e + 1, tt0 : tt0 + RECV_TILE],
                     [RECV_TILE, 1],
                 )
-                row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
+                h_scale_blk = pl.reshape(
+                    pl.row_max(h_tile_scale_dq), [RECV_TILE, 1]
+                )
+                row_scale_blk = pl.mul(h_scale_blk, w_col_blk)
                 for dg in pl.pipeline(W2_ACT_INNER, stage=2):
                     act_d0 = act_d_base + dg * D_OUT_TILE_ACT
                     y_2d_i32 = y_i32[:, act_d0 : act_d0 + D_OUT_TILE_ACT]
