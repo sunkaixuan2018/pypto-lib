@@ -126,14 +126,6 @@ int main(int argc, char **argv)
         ACL_MEMCPY_HOST_TO_DEVICE));
 
     aclTensor *x = CreateTensor(xDevice, {kM, kK}, ACL_INT8, ACL_FORMAT_ND);
-    aclTensor *weight =
-        CreateTensor(
-            weightDevice, {kExperts, kK, kW13N}, ACL_INT4, ACL_FORMAT_FRACTAL_NZ,
-            {kExperts, kK / 64, kW13N / 16, 16, 64});
-    aclTensor *weightScale = CreateTensor(
-        weightScaleDevice, {kExperts, kW13N, 2}, ACL_FLOAT, ACL_FORMAT_ND);
-    aclTensor *assist =
-        CreateTensor(assistDevice, {kExperts, kW13N}, ACL_FLOAT, ACL_FORMAT_ND);
     aclTensor *xScale =
         CreateTensor(xScaleDevice, {kM}, ACL_FLOAT8_E8M0, ACL_FORMAT_ND);
     aclTensor *groupList =
@@ -143,18 +135,47 @@ int main(int argc, char **argv)
     aclTensor *outputScale =
         CreateTensor(outputScaleDevice, {kM}, ACL_FLOAT, ACL_FORMAT_ND);
 
-    const aclTensor *weightItems[] = {weight};
-    const aclTensor *weightScaleItems[] = {weightScale};
-    const aclTensor *assistItems[] = {assist};
-    aclTensorList *weights = aclCreateTensorList(weightItems, 1);
-    aclTensorList *weightScales = aclCreateTensorList(weightScaleItems, 1);
-    aclTensorList *assists = aclCreateTensorList(assistItems, 1);
+    std::vector<aclTensor *> weightTensors;
+    std::vector<aclTensor *> weightScaleTensors;
+    std::vector<aclTensor *> assistTensors;
+    std::vector<const aclTensor *> weightItems;
+    std::vector<const aclTensor *> weightScaleItems;
+    std::vector<const aclTensor *> assistItems;
+    const size_t weightBytesPerExpert = PackedInt4Bytes(kK * kW13N);
+    const size_t weightScaleBytesPerExpert =
+        static_cast<size_t>(kW13N * 2) * sizeof(float);
+    const size_t assistBytesPerExpert = static_cast<size_t>(kW13N) * sizeof(float);
+    for (int64_t expert = 0; expert < kExperts; ++expert) {
+        aclTensor *weight = CreateTensor(
+            static_cast<uint8_t *>(weightDevice) + expert * weightBytesPerExpert,
+            {kK, kW13N}, ACL_INT4, ACL_FORMAT_FRACTAL_NZ,
+            {kK / 64, kW13N / 16, 16, 64});
+        aclTensor *weightScale = CreateTensor(
+            static_cast<uint8_t *>(weightScaleDevice) + expert * weightScaleBytesPerExpert,
+            {kW13N, 2}, ACL_FLOAT, ACL_FORMAT_ND);
+        aclTensor *assist = CreateTensor(
+            static_cast<uint8_t *>(assistDevice) + expert * assistBytesPerExpert, {kW13N},
+            ACL_FLOAT, ACL_FORMAT_ND);
+        weightTensors.push_back(weight);
+        weightScaleTensors.push_back(weightScale);
+        assistTensors.push_back(assist);
+        weightItems.push_back(weight);
+        weightScaleItems.push_back(weightScale);
+        assistItems.push_back(assist);
+    }
+    aclTensorList *weights = aclCreateTensorList(weightItems.data(), weightItems.size());
+    aclTensorList *weightScales =
+        aclCreateTensorList(weightScaleItems.data(), weightScaleItems.size());
+    aclTensorList *assists = aclCreateTensorList(assistItems.data(), assistItems.size());
     const int64_t tuningValues[] = {kRowsPerExpert};
     aclIntArray *tuning = aclCreateIntArray(tuningValues, 1);
 
-    if (x == nullptr || weight == nullptr || weightScale == nullptr || assist == nullptr ||
-        xScale == nullptr || groupList == nullptr || output == nullptr ||
-        outputScale == nullptr || weights == nullptr || weightScales == nullptr ||
+    const auto hasNull = [](const std::vector<aclTensor *> &tensors) {
+        return std::find(tensors.begin(), tensors.end(), nullptr) != tensors.end();
+    };
+    if (x == nullptr || xScale == nullptr || groupList == nullptr || output == nullptr ||
+        outputScale == nullptr || hasNull(weightTensors) || hasNull(weightScaleTensors) ||
+        hasNull(assistTensors) || weights == nullptr || weightScales == nullptr ||
         assists == nullptr || tuning == nullptr) {
         std::cerr << "Failed to create one or more ACL metadata objects\n";
         return 1;
@@ -238,9 +259,15 @@ int main(int argc, char **argv)
     CHECK_ACL(aclDestroyTensor(output));
     CHECK_ACL(aclDestroyTensor(groupList));
     CHECK_ACL(aclDestroyTensor(xScale));
-    CHECK_ACL(aclDestroyTensor(assist));
-    CHECK_ACL(aclDestroyTensor(weightScale));
-    CHECK_ACL(aclDestroyTensor(weight));
+    for (aclTensor *tensor : assistTensors) {
+        CHECK_ACL(aclDestroyTensor(tensor));
+    }
+    for (aclTensor *tensor : weightScaleTensors) {
+        CHECK_ACL(aclDestroyTensor(tensor));
+    }
+    for (aclTensor *tensor : weightTensors) {
+        CHECK_ACL(aclDestroyTensor(tensor));
+    }
     CHECK_ACL(aclDestroyTensor(x));
 
     for (void *ptr : {xDevice, weightDevice, weightScaleDevice, assistDevice, xScaleDevice,
