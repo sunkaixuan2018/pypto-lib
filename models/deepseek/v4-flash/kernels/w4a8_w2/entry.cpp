@@ -29,6 +29,52 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) { (void)args; }
 #define CATLASS_ARCH 2201
 #endif
 
+#include "intrinsic.h"
+#include "kernel_operator.h"
+
+// Catlass standalone kernels derive work partitioning from CANN's native
+// topology accessors.  Under PyPTO's persistent MIX dispatcher those accessors
+// do not describe the logical SPMD task: in particular, both AIV lanes report
+// native block/lane values as zero.  Bridge just the Catlass include boundary
+// to PyPTO's runtime payload while leaving Catlass's physical CrossCore flags
+// untouched.
+namespace AscendC {
+
+[[block_local]] static uint32_t pypto_catlass_block_idx;
+[[block_local]] static uint32_t pypto_catlass_block_num;
+[[block_local]] static uint32_t pypto_catlass_sub_block_idx;
+[[block_local]] static uint32_t pypto_catlass_sub_block_num;
+
+static __aicore__ __attribute__((always_inline)) uint32_t
+PyptoGetBlockIdx() {
+    return pypto_catlass_block_idx;
+}
+
+static __aicore__ __attribute__((always_inline)) uint32_t
+PyptoGetBlockNum() {
+    return pypto_catlass_block_num;
+}
+
+static __aicore__ __attribute__((always_inline)) uint32_t
+PyptoGetSubBlockIdx() {
+    return pypto_catlass_sub_block_idx;
+}
+
+static __aicore__ __attribute__((always_inline)) uint32_t
+PyptoGetSubBlockNum() {
+    return pypto_catlass_sub_block_num;
+}
+
+}  // namespace AscendC
+
+// Function-name macros preserve Catlass source and type structure.  On AIV,
+// PyptoGetBlockIdx returns the flattened (logical block, lane) index that the
+// stock W4A8 kernel expects before dividing by GetSubBlockNum().
+#define GetBlockIdx PyptoGetBlockIdx
+#define GetBlockNum PyptoGetBlockNum
+#define GetSubBlockIdx PyptoGetSubBlockIdx
+#define GetSubBlockNum PyptoGetSubBlockNum
+
 #include "catlass/arch/arch.hpp"
 #include "catlass/gemm/block/block_mmad.hpp"
 #include "catlass/gemm/block/block_swizzle.hpp"
@@ -37,6 +83,11 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) { (void)args; }
 #include "catlass/gemm/kernel/w4a8_matmul.hpp"
 #include "catlass/gemm/tile/tile_copy.hpp"
 #include "catlass/layout/layout.hpp"
+
+#undef GetSubBlockNum
+#undef GetSubBlockIdx
+#undef GetBlockNum
+#undef GetBlockIdx
 
 namespace {
 
@@ -51,6 +102,25 @@ tensor_data(__gm__ int64_t *args, int32_t index) {
     __gm__ T *data =
         reinterpret_cast<__gm__ T *>(tensor->buffer.addr) + tensor->start_offset;
     return reinterpret_cast<GM_ADDR>(data);
+}
+
+static __aicore__ __attribute__((always_inline)) void
+set_catlass_runtime_topology(__gm__ int64_t *args) {
+    const uint32_t logical_block =
+        static_cast<uint32_t>(get_block_idx(args));
+    AscendC::pypto_catlass_block_num =
+        static_cast<uint32_t>(get_block_num(args));
+#ifdef __DAV_C220_CUBE__
+    AscendC::pypto_catlass_block_idx = logical_block;
+    AscendC::pypto_catlass_sub_block_idx = 0;
+    AscendC::pypto_catlass_sub_block_num = 1;
+#elif defined(__DAV_C220_VEC__)
+    const uint32_t logical_lane =
+        static_cast<uint32_t>(get_sub_block_id(args));
+    AscendC::pypto_catlass_block_idx = logical_block * 2 + logical_lane;
+    AscendC::pypto_catlass_sub_block_idx = logical_lane;
+    AscendC::pypto_catlass_sub_block_num = 2;
+#endif
 }
 
 using namespace Catlass;
@@ -91,6 +161,8 @@ using MatmulKernel = Gemm::Kernel::W4A8Matmul<BlockMmad, void, BlockScheduler>;
 }  // namespace
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    set_catlass_runtime_topology(args);
+
     // PyPTO packs tensors in signature order:
     //   0=out, 1=activation, 2=packed_weight_kn, 3=workspace.
     typename MatmulKernel::Params params{
