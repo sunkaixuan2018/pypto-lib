@@ -47,7 +47,7 @@ constexpr uint32_t kN = 4096;
 template <typename T>
 static __aicore__ __attribute__((always_inline)) GM_ADDR
 tensor_data(__gm__ int64_t *args, int32_t index) {
-    __gm__ Tensor *tensor = reinterpret_cast<__gm__ Tensor *>(args[index]);
+    __gm__ ::Tensor *tensor = reinterpret_cast<__gm__ ::Tensor *>(args[index]);
     __gm__ T *data =
         reinterpret_cast<__gm__ T *>(tensor->buffer.addr) + tensor->start_offset;
     return reinterpret_cast<GM_ADDR>(data);
