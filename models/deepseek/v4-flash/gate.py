@@ -76,10 +76,6 @@ def gate(
     xn_scale_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
     route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
-    # Hash routing consumes only TOPK fixed expert ids per token. Keep each
-    # scalar score in its own 32 B row so independent SPMD blocks never share
-    # a sub-line store.
-    hash_scores_buf = pl.create_tensor([T * TOPK, TOPK_PAD], dtype=pl.FP32)
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
@@ -173,126 +169,71 @@ def gate(
     # Fan the matmul over expert columns so each block computes a [GATE_M_TILE,
     # GATE_N_TILE] slice on its own core; token-tile is the dynamic dim, so it
     # stays outermost and // % divide by the compile-time GATE_N_BLOCKS.
-    if layer_id < N_HASH_LAYERS:
-        # Hash layers know the TOPK expert ids before scoring. Directly evaluate
-        # the selected 48 (token, expert) pairs instead of materializing all 128
-        # expert scores and throwing 122 per token away.
-        for hp_idx in pl.spmd(
-            active_tokens * TOPK,
-            name_hint="gate_hash_score",
-            allow_early_resolve=True,
-        ):
-            hp_t = hp_idx // TOPK
-            hp_k = hp_idx % TOPK
-            hp_token = pl.cast(pl.read(input_ids, [hp_t]), pl.INDEX)
-            hp_eid = pl.cast(pl.read(tid2eid, [hp_token, hp_k]), pl.INDEX)
-
-            hp_x = pl.tile.load(xg_buf, [hp_t, 0], [1, D])
-            hp_w = pl.tile.load(gate_w, [hp_eid, 0], [1, D])
-            hp_product_rows = pl.reshape(pl.mul(hp_x, hp_w), [ROW_PAD, FFN_REDUCE_TILE])
-            hp_partial_tmp = pl.create_tile([ROW_PAD, FFN_REDUCE_TILE], dtype=pl.FP32)
-            hp_partial = pl.row_sum(hp_product_rows, hp_partial_tmp)
-            hp_reduce = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-            hp_reduce[0:1, :] = pl.reshape(hp_partial, [1, ROW_PAD])
-            hp_reduce = pl.set_validshape(hp_reduce, 1, ROW_PAD)
-            hp_sum_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
-            hp_logit = pl.row_sum(hp_reduce, hp_sum_tmp)
-            hp_logit = pl.set_validshape(pl.reshape(hp_logit, [1, ROW_PAD]), 1, 1)
-            hp_logit = pl.mul(hp_logit, pl.read(inv_rms_buf, [hp_t, 0]))
-
-            hp_relu = pl.maximum(hp_logit, 0.0)
-            hp_abs = pl.maximum(hp_logit, pl.neg(hp_logit))
-            hp_softplus_log = pl.add(
-                hp_relu,
-                pl.log(pl.add(pl.exp(pl.neg(hp_abs)), 1.0)),
-            )
-            hp_neg_floor_mask = pl.minimum(
-                pl.maximum(pl.sub(pl.neg(hp_logit), 10.0), 0.0),
-                1.0,
-            )
-            hp_neg_floor = pl.mul(
-                hp_neg_floor_mask,
-                pl.exp(pl.minimum(hp_logit, 0.0)),
-            )
-            hp_score = pl.sqrt(pl.maximum(hp_softplus_log, hp_neg_floor))
-            pl.tile.store(hp_score, [hp_idx, 0], hash_scores_buf, shapes=[1, 1])
-    else:
-        GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
-        for gb_idx in pl.spmd(
-            active_gate_tiles * GATE_N_BLOCKS,
-            name_hint="gate",
-            allow_early_resolve=True,
-        ):
-            tg = gb_idx // GATE_N_BLOCKS
-            nb = gb_idx % GATE_N_BLOCKS
-            t1 = tg * GATE_M_TILE
-            n0 = nb * GATE_N_TILE
-            gp_bias_row = pl.reshape(gate_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
-            gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
-            for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
-                gd_kd = kb * GATE_D_TILE
-                gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
-                gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
-                if gd_kd == 0:
-                    gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
-                else:
-                    gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
-            # xg omitted inv_rms; apply its positive per-token factor here.
-            gate_logits_tile = pl.row_expand_mul(
-                gate_logits_tile,
-                inv_rms_buf[t1 : t1 + GATE_M_TILE, 0:1],
-            )
-            gp_relu = pl.maximum(gate_logits_tile, 0.0)
-            gp_abs = pl.maximum(gate_logits_tile, pl.neg(gate_logits_tile))
-            gp_softplus_log = pl.add(gp_relu, pl.log(pl.add(pl.exp(pl.neg(gp_abs)), 1.0)))
-            gp_neg_floor_mask = pl.minimum(
-                pl.maximum(pl.sub(pl.neg(gate_logits_tile), 10.0), 0.0),
-                1.0,
-            )
-            gp_neg_floor = pl.mul(gp_neg_floor_mask, pl.exp(pl.minimum(gate_logits_tile, 0.0)))
-            gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
-            gp_score = pl.sqrt(gp_softplus)
-            route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
-            gp_bias = pl.col_expand_mul(
-                pl.full([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32, value=1.0), gp_bias_row
-            )
+    GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
+    for gb_idx in pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate", allow_early_resolve=True):
+        tg = gb_idx // GATE_N_BLOCKS
+        nb = gb_idx % GATE_N_BLOCKS
+        t1 = tg * GATE_M_TILE
+        n0 = nb * GATE_N_TILE
+        gp_bias_row = pl.reshape(gate_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
+        gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
+        for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
+            gd_kd = kb * GATE_D_TILE
+            gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
+            gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
+            if gd_kd == 0:
+                gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
+            else:
+                gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
+        # xg omitted inv_rms; logits = inv_rms * (xg @ gate_w.T). Per-token row-scale.
+        gate_logits_tile = pl.row_expand_mul(gate_logits_tile, inv_rms_buf[t1 : t1 + GATE_M_TILE, 0:1])
+        gp_relu = pl.maximum(gate_logits_tile, 0.0)
+        gp_abs = pl.maximum(gate_logits_tile, pl.neg(gate_logits_tile))
+        gp_softplus_log = pl.add(gp_relu, pl.log(pl.add(pl.exp(pl.neg(gp_abs)), 1.0)))
+        gp_neg_floor_mask = pl.minimum(pl.maximum(pl.sub(pl.neg(gate_logits_tile), 10.0), 0.0), 1.0)
+        gp_neg_floor = pl.mul(gp_neg_floor_mask, pl.exp(pl.minimum(gate_logits_tile, 0.0)))
+        gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
+        gp_score = pl.sqrt(gp_softplus)
+        route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
+        if layer_id >= N_HASH_LAYERS:
+            gp_bias = pl.col_expand_mul(pl.full([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32, value=1.0), gp_bias_row)
             gp_biased = pl.add(gp_score, gp_bias)
             biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
 
     active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
     # Hash layers index via tid2eid[input_ids]; score layers sort+gather.
     if layer_id < N_HASH_LAYERS:
-        for th_idx in pl.spmd(
-            active_tokens,
-            name_hint="route_hash_sparse",
-            allow_early_resolve=True,
-        ):
-            hs_vals_pad = pl.tile.full([ROW_PAD, TOPK_PAD], dtype=pl.FP32, value=0.0)
-            hs_token = pl.cast(pl.read(input_ids, [th_idx]), pl.INDEX)
-            for hs_k in pl.range(TOPK):
-                hp_idx = th_idx * TOPK + hs_k
-                pl.tile.write(
-                    hs_vals_pad,
-                    [0, hs_k],
-                    pl.read(hash_scores_buf, [hp_idx, 0]),
-                )
-                pl.write(
-                    indices,
-                    [th_idx, hs_k],
-                    pl.read(tid2eid, [hs_token, hs_k]),
-                )
-            hs_vals_pad = pl.set_validshape(hs_vals_pad, 1, TOPK_PAD)
-            hs_denom_tmp = pl.create_tile([ROW_PAD, TOPK_PAD], dtype=pl.FP32)
-            hs_denom_tile = pl.row_sum(hs_vals_pad, hs_denom_tmp)
-            hs_denom = pl.read(hs_denom_tile, [0, 0])
-            for hs_k in pl.range(TOPK):
-                hp_idx = th_idx * TOPK + hs_k
-                hs_score = pl.read(hash_scores_buf, [hp_idx, 0])
-                pl.write(
-                    weights,
-                    [th_idx, hs_k],
-                    pl.mul(pl.div(hs_score, hs_denom), ROUTE_SCALE),
-                )
+        for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True):
+            t1 = th_idx * GATE_T_TILE
+            # eids from tid2eid[input_ids]: scalar lookup (dynamic row index) into a
+            # Tensor. tid2eid row load hits the 32B tile floor (TOPK*4=24B), so the
+            # index build stays scalar; the score fetch is a batched gather below.
+            # Tail [TOPK, TOPK_PAD) zeroed so fillpad drops it from the sum.
+            hs_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
+            for hs_tt in pl.range(GATE_T_TILE):
+                hs_token = pl.cast(pl.read(input_ids, [t1 + hs_tt]), pl.INDEX)
+                for hs_k in pl.range(TOPK):
+                    pl.write(hs_idx_tile, [hs_tt, hs_k], pl.read(tid2eid, [hs_token, hs_k]))
+                for hs_pad_k in pl.range(TOPK, TOPK_PAD):
+                    pl.write(hs_idx_tile, [hs_tt, hs_pad_k], pl.cast(0, pl.INT32))
+            # Batched score gather (replaces per-eid scalar reads); set_validshape +
+            # fillpad zero the [TOPK, TOPK_PAD) tail so row_sum sees only TOPK.
+            local_scores = pl.create_tensor([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32)
+            local_scores[:, :] = route_scores_buf[t1 : t1 + GATE_T_TILE, :]
+            gather_all = pl.gather(local_scores, dim=-1, index=hs_idx_tile)
+            gather_valid = pl.set_validshape(gather_all, GATE_T_TILE, TOPK)
+            hs_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
+            # Copy to dodge the tensor_view-vs-ptr SSA conflict between the gather
+            # and the scalar pl.read below (pypto #1493).
+            hs_idx_read = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
+            hs_idx_read[:, :] = hs_idx_tile[:, :]
+            hs_denom = pl.reshape(pl.row_sum(hs_vals_pad), [GATE_T_TILE, 1])
+            hs_weights_pad = pl.mul(pl.row_expand_div(hs_vals_pad, hs_denom), ROUTE_SCALE)
+            for hs_wt_tt in pl.range(GATE_T_TILE):
+                if t1 + hs_wt_tt < active_tokens:
+                    for hs_wt_k in pl.range(TOPK):
+                        pl.write(indices, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_idx_read, [hs_wt_tt, hs_wt_k]))
+                        pl.write(weights, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_weights_pad, [hs_wt_tt, hs_wt_k]))
     else:
         for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=True):
             t1 = ts_idx * GATE_T_TILE
