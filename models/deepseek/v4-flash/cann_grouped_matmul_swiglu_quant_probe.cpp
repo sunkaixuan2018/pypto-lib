@@ -1,7 +1,7 @@
 /**
  * Standalone host-side CANN probe for the EP8 routed-expert W13 stage.
  *
- * The production shape is 16 local experts, 16 routed rows per expert,
+ * The EP8 balanced-routing shape is 16 local experts, 3 routed rows per expert,
  * hidden size 4096, and concatenated gate/up width 4096.  The probe uses
  * packed INT4 FRACTAL_NZ weights and measures the official CANN fused
  * GroupedMatmul + SwiGLU + per-token INT8 quantization operator.
@@ -13,7 +13,7 @@
 
 #include <acl/acl.h>
 #include <aclnn/acl_meta.h>
-#include <aclnnop/aclnn_grouped_matmul_swiglu_quant_weight_nz_v2.h>
+#include "aclnn_grouped_matmul_swiglu_quant_weight_nz_v2.h"
 
 #include <algorithm>
 #include <cmath>
@@ -30,7 +30,7 @@
 namespace {
 
 constexpr int64_t kExperts = 16;
-constexpr int64_t kRowsPerExpert = 16;
+constexpr int64_t kRowsPerExpert = 3;
 constexpr int64_t kM = kExperts * kRowsPerExpert;
 constexpr int64_t kK = 4096;
 constexpr int64_t kW13N = 4096;
