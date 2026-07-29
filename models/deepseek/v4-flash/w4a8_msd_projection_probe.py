@@ -267,6 +267,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument(
+        "--enable-pmu", type=int, nargs="?", const=2, default=0
+    )
     args = parser.parse_args()
 
     if args.shape == "gate":
@@ -284,6 +287,7 @@ if __name__ == "__main__":
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
+            enable_pmu=args.enable_pmu,
         ),
         rtol=0.0,
         atol=0.0,
