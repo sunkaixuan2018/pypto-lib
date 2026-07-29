@@ -64,7 +64,7 @@ using namespace Catlass;
 
 using ElementI4 = AscendC::int4b_t;
 using ArchTag = Arch::AtlasA2;
-using DispatchPolicy = Gemm::MmadAtlasA2Pingpong<false>;
+using DispatchPolicy = Gemm::MmadAtlasA2FullLoadA<false>;
 using L1TileShape = GemmShape<128, kNTile, kKTile>;
 using L0TileShape = GemmShape<128, kNTile, 128>;
 using AType = Gemm::GemmType<ElementI4, layout::RowMajor>;
@@ -119,7 +119,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
             activation, layout_a,
             task_b, task_b_layout,
             task_c, task_c_layout,
-            task_shape);
+            task_shape, inner == 0);
     }
 #else
     (void)args;
