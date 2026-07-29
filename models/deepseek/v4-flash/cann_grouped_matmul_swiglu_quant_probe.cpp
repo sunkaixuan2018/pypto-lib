@@ -123,9 +123,15 @@ int main(int argc, char **argv)
         CHECK_ACL(aclrtMemset(weightDevice, weightBytes, 0x11, weightBytes));
     }
 
-    constexpr uint64_t kPackedUnitScales = 0x3F8000003F800000ULL;
+    // Fixpipe dequant scale format stores FP32 bits in the low word and keeps
+    // the high word zero.  It is not a pair of independent FP32 values.
+    constexpr uint64_t kFixpipeUnitScale = 0x000000003F800000ULL;
     std::vector<uint64_t> weightScaleHost(
-        static_cast<size_t>(kExperts * kW13N), kPackedUnitScales);
+        static_cast<size_t>(kExperts * kW13N), kFixpipeUnitScale);
+    // The A8W4 MSD path rewrites x as hi*16 + ((x & 0xf) - 8).  Restore
+    // the subtracted eight through the official per-channel assist matrix.
+    const float assistValue = nonzero ? 8.0F * static_cast<float>(kK) : 0.0F;
+    std::vector<float> assistHost(static_cast<size_t>(kExperts * kW13N), assistValue);
     std::vector<float> xScaleHost(static_cast<size_t>(kM), 1.0F);
     std::vector<int64_t> groupListHost(static_cast<size_t>(kExperts), kRowsPerExpert);
     CHECK_ACL(aclrtMemcpy(
@@ -133,6 +139,9 @@ int main(int argc, char **argv)
         ACL_MEMCPY_HOST_TO_DEVICE));
     CHECK_ACL(aclrtMemcpy(
         xScaleDevice, xScaleBytes, xScaleHost.data(), xScaleBytes, ACL_MEMCPY_HOST_TO_DEVICE));
+    CHECK_ACL(aclrtMemcpy(
+        assistDevice, assistBytes, assistHost.data(), assistBytes,
+        ACL_MEMCPY_HOST_TO_DEVICE));
     CHECK_ACL(aclrtMemcpy(
         groupListDevice, groupListBytes, groupListHost.data(), groupListBytes,
         ACL_MEMCPY_HOST_TO_DEVICE));
