@@ -46,7 +46,10 @@ def _npu_tensor(shape: tuple[int, ...], value: int | float, dtype: torch.dtype) 
 
 def _nz_weight(rows: int, packed_columns: int, value: int) -> torch.Tensor:
     nd = _npu_tensor((rows, packed_columns), value, torch.int32)
-    return torch_npu.npu_format_cast(nd, 29)
+    nz = torch_npu.npu_format_cast(nd, 29)
+    if torch_npu.get_npu_format(nz) != 29:
+        raise RuntimeError("expected FRACTAL_NZ format 29")
+    return nz
 
 
 def _comm_name(rank: int) -> str:
@@ -142,7 +145,7 @@ def main() -> None:
         f"python={sys.version.split()[0]} numpy={numpy.__version__} "
         f"scipy={scipy.__version__} "
         f"torch={torch.__version__} torch_npu={torch_npu.__version__} "
-        f"allow_internal_format={torch_npu.npu.config.allow_internal_format} "
+        f"internal_format_requested=True "
         f"extension={extension} free_before={free_before} "
         f"free_after={free_after} total_hbm={total_hbm}",
         flush=True,
