@@ -38,6 +38,8 @@ MM_INTER_TILE = 256
 MM_GATE_INNER = 4
 ACT_INTER_TILE = 128
 ACT_GATE_INNER = 4
+ACT_ROW_PAD = 8
+ACT_ROWS_PER_BLOCK = 2
 D_OUT_TILE = 256
 # h_tile_i8 store innermost = QUANT_TILE bytes (int8); 512 hits the a2a3 L2 cache
 # line (perf_hint PH001 flagged the prior 256B store as sub-line).
@@ -138,52 +140,147 @@ def expert_routed(
             flat_tt0 = e_flat_base + tt0
             valid_rows = pl.min(RECV_TILE, e_rows - tt0)
 
+            # Own complete rows in one AIV task so activation, row amax, and
+            # requantization share a task boundary.  The FP32 tile remains
+            # task-local scratch instead of crossing from exp_gate_up_act to
+            # a separate exp_h_q task.
             h_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
-
-            with pl.spmd(MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE), name_hint="exp_gate_up_act"):
-                ab_idx = pl.tile.get_block_idx()
-                a_base = ab_idx * (ACT_GATE_INNER * ACT_INTER_TILE)
-                for ag in pl.pipeline(ACT_GATE_INNER, stage=2):
-                    a0 = a_base + ag * ACT_INTER_TILE
-                    gate_2d_i32 = gate_slab[tt0 : tt0 + RECV_TILE, a0 : a0 + ACT_INTER_TILE]
-                    up_2d_i32 = up_slab[tt0 : tt0 + RECV_TILE, a0 : a0 + ACT_INTER_TILE]
-                    recv_x_scale_dq = pl.reshape(recv_scale_dq[local_e : local_e + 1, tt0 : tt0 + RECV_TILE], [RECV_TILE, 1])
-                    w1_scale_chunk = routed_w1_scale[local_e : local_e + 1, a0 : a0 + ACT_INTER_TILE]
-                    w3_scale_chunk = routed_w3_scale[local_e : local_e + 1, a0 : a0 + ACT_INTER_TILE]
-                    gate_2d = pl.cast(gate_2d_i32, target_type=pl.FP32, mode="none")
-                    up_2d = pl.cast(up_2d_i32, target_type=pl.FP32, mode="none")
-                    gate_2d = pl.col_expand_mul(pl.row_expand_mul(gate_2d, recv_x_scale_dq), w1_scale_chunk)
-                    up_2d = pl.col_expand_mul(pl.row_expand_mul(up_2d, recv_x_scale_dq), w3_scale_chunk)
+            h_tile_i8 = pl.create_tensor(
+                [RECV_TILE, MOE_INTER], dtype=pl.INT8, init_value=0
+            )
+            h_tile_scale_dq = pl.create_tensor(
+                [RECV_TILE, 1], dtype=pl.FP32, init_value=0.0, manual_dep=True
+            )
+            active_row_blocks = (
+                valid_rows + ACT_ROWS_PER_BLOCK - 1
+            ) // ACT_ROWS_PER_BLOCK
+            for row_block in pl.spmd(
+                active_row_blocks,
+                name_hint="exp_gate_up_act_q",
+            ):
+                row0 = row_block * ACT_ROWS_PER_BLOCK
+                block_valid_rows = pl.min(
+                    ACT_ROWS_PER_BLOCK, valid_rows - row0
+                )
+                recv_x_scale_rows = pl.slice(
+                    recv_scale_dq,
+                    [1, ACT_ROW_PAD],
+                    [local_e, tt0 + row0],
+                    valid_shape=[1, block_valid_rows],
+                )
+                recv_x_scale_dq = pl.reshape(
+                    recv_x_scale_rows, [ACT_ROW_PAD, 1]
+                )
+                row_amax = pl.full(
+                    [1, ACT_ROW_PAD],
+                    dtype=pl.FP32,
+                    value=INT8_AMAX_EPS,
+                )
+                for part in pl.pipeline(
+                    0, MOE_INTER // ACT_INTER_TILE, stage=1
+                ):
+                    a0 = part * ACT_INTER_TILE
+                    gate_2d_i32 = pl.slice(
+                        gate_slab,
+                        [ACT_ROW_PAD, ACT_INTER_TILE],
+                        [tt0 + row0, a0],
+                        valid_shape=[block_valid_rows, ACT_INTER_TILE],
+                    )
+                    up_2d_i32 = pl.slice(
+                        up_slab,
+                        [ACT_ROW_PAD, ACT_INTER_TILE],
+                        [tt0 + row0, a0],
+                        valid_shape=[block_valid_rows, ACT_INTER_TILE],
+                    )
+                    w1_scale_chunk = routed_w1_scale[
+                        local_e : local_e + 1, a0 : a0 + ACT_INTER_TILE
+                    ]
+                    w3_scale_chunk = routed_w3_scale[
+                        local_e : local_e + 1, a0 : a0 + ACT_INTER_TILE
+                    ]
+                    gate_2d = pl.cast(
+                        gate_2d_i32, target_type=pl.FP32, mode="none"
+                    )
+                    up_2d = pl.cast(
+                        up_2d_i32, target_type=pl.FP32, mode="none"
+                    )
+                    gate_2d = pl.col_expand_mul(
+                        pl.row_expand_mul(gate_2d, recv_x_scale_dq),
+                        w1_scale_chunk,
+                    )
+                    up_2d = pl.col_expand_mul(
+                        pl.row_expand_mul(up_2d, recv_x_scale_dq),
+                        w3_scale_chunk,
+                    )
                     if SWIGLU_LIMIT > 0.0:
                         gate_2d = pl.minimum(gate_2d, SWIGLU_LIMIT)
-                        up_2d = pl.maximum(pl.minimum(up_2d, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-                    sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_2d)), 1.0))
-                    silu = pl.mul(gate_2d, sigmoid)
-                    gated = pl.mul(silu, up_2d)
-                    gated_valid = pl.set_validshape(gated, valid_rows, ACT_INTER_TILE)
-                    gated_masked = pl.fillpad(gated_valid, pad_value=pl.PadValue.zero)
-                    h_tile_fp32[:, a0 : a0 + ACT_INTER_TILE] = gated_masked
+                        up_2d = pl.maximum(
+                            pl.minimum(up_2d, SWIGLU_LIMIT), -SWIGLU_LIMIT
+                        )
+                    sigmoid = pl.recip(
+                        pl.add(pl.exp(pl.neg(gate_2d)), 1.0)
+                    )
+                    gated = pl.mul(pl.mul(gate_2d, sigmoid), up_2d)
+                    gated_masked = pl.fillpad(
+                        pl.set_validshape(
+                            gated, block_valid_rows, ACT_INTER_TILE
+                        ),
+                        pad_value=pl.PadValue.zero,
+                    )
+                    chunk_amax = pl.reshape(
+                        pl.row_max(
+                            pl.maximum(gated_masked, pl.neg(gated_masked))
+                        ),
+                        [1, ACT_ROW_PAD],
+                    )
+                    row_amax = pl.maximum(row_amax, chunk_amax)
+                    h_tile_fp32[
+                        row0 : row0 + ACT_ROWS_PER_BLOCK,
+                        a0 : a0 + ACT_INTER_TILE,
+                    ] = gated_masked[0:ACT_ROWS_PER_BLOCK, :]
 
-            h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
-            h_tile_scale_dq = pl.create_tensor([RECV_TILE, 1], dtype=pl.FP32, manual_dep=True)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_q"):
-                eh_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
-                    eh_a_f32 = h_tile_fp32[:, k0 : k0 + QUANT_TILE]
-                    eh_a_abs = pl.maximum(eh_a_f32, pl.neg(eh_a_f32))
-                    eh_a_max = pl.reshape(pl.row_max(eh_a_abs), [1, RECV_TILE])
-                    eh_amax = pl.maximum(eh_amax, eh_a_max)
-                eh_sq_row = pl.div(
-                    pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), eh_amax
+                row_scale_q = pl.div(
+                    pl.full(
+                        [1, ACT_ROW_PAD],
+                        dtype=pl.FP32,
+                        value=INT8_SCALE_MAX,
+                    ),
+                    row_amax,
                 )
-                h_tile_scale_dq[:, :] = pl.reshape(pl.recip(eh_sq_row), [RECV_TILE, 1])
-                eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
-                for k1 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
-                    eh_q_f32 = h_tile_fp32[:, k1 : k1 + QUANT_TILE]
-                    eh_q_scaled = pl.row_expand_mul(eh_q_f32, eh_sq_col)
-                    eh_q_i32 = pl.cast(eh_q_scaled, target_type=pl.INT32, mode="rint")
-                    eh_q_half = pl.cast(eh_q_i32, target_type=pl.FP16, mode="round")
-                    h_tile_i8[:, k1 : k1 + QUANT_TILE] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
+                row_scale_q_col = pl.reshape(
+                    row_scale_q, [ACT_ROW_PAD, 1]
+                )
+                row_scale_dq_col = pl.reshape(
+                    pl.recip(row_scale_q), [ACT_ROW_PAD, 1]
+                )
+                h_tile_scale_dq[
+                    row0 : row0 + ACT_ROWS_PER_BLOCK, :
+                ] = row_scale_dq_col[0:ACT_ROWS_PER_BLOCK, :]
+                for q_idx in pl.pipeline(
+                    0, MOE_INTER // QUANT_TILE, stage=1
+                ):
+                    k0 = q_idx * QUANT_TILE
+                    h_fp32 = pl.slice(
+                        h_tile_fp32,
+                        [ACT_ROW_PAD, QUANT_TILE],
+                        [row0, k0],
+                        valid_shape=[ACT_ROWS_PER_BLOCK, QUANT_TILE],
+                    )
+                    h_scaled = pl.row_expand_mul(
+                        h_fp32, row_scale_q_col
+                    )
+                    h_i32 = pl.cast(
+                        h_scaled, target_type=pl.INT32, mode="rint"
+                    )
+                    h_fp16 = pl.cast(
+                        h_i32, target_type=pl.FP16, mode="round"
+                    )
+                    h_tile_i8[
+                        row0 : row0 + ACT_ROWS_PER_BLOCK,
+                        k0 : k0 + QUANT_TILE,
+                    ] = pl.cast(
+                        h_fp16, target_type=pl.INT8, mode="trunc"
+                    )[0:ACT_ROWS_PER_BLOCK, :]
 
             y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
             with pl.spmd(
