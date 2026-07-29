@@ -39,6 +39,9 @@ MARKER_COLUMNS = 16
 MARKER_BYTES = MARKER_ROWS * MARKER_COLUMNS * 4
 TILECAST_BYTES = 16 * 4 * L1_K * L1_N
 TILECAST_OUTPUT_BYTES = MARKER_BYTES + TILECAST_BYTES
+AIC_MMAD_K = 1024
+AIC_MMAD_WORKSPACE_BYTES = BLOCK_DIM * STAGES * L1_K * L1_N
+AIC_MMAD_OUTPUT_BYTES = MARKER_BYTES + M * N * 4
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _KERNEL_DIR = Path(__file__).parent / "kernels" / "w4a8_w2"
@@ -49,6 +52,7 @@ _RESOURCE_ENTRY = _KERNEL_DIR / "resource_entry.cpp"
 _BLOCKMMAD_ENTRY = _KERNEL_DIR / "blockmmad_entry.cpp"
 _PINGPONG_ENTRY = _KERNEL_DIR / "pingpong_entry.cpp"
 _TILECAST_ENTRY = _KERNEL_DIR / "tilecast_entry.cpp"
+_AIC_MMAD_ENTRY = _KERNEL_DIR / "aic_mmad_entry.cpp"
 _CATLASS_INCLUDE = _REPO_ROOT / "third_party" / "catlass" / "include"
 
 
@@ -151,6 +155,33 @@ def tilecast_data_cce(
     output: pl.Out[pl.Tensor],
     packed_weight_kn: pl.Tensor,
 ) -> pl.Tensor: ...
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_AIC_MMAD_ENTRY,
+    aiv_source=_AIC_MMAD_ENTRY,
+    include_dirs=_EXTERN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def aic_workspace_mmad_cce(
+    output: pl.Out[pl.Tensor],
+    activation: pl.Tensor,
+    workspace: pl.Tensor,
+) -> pl.Tensor: ...
+
+
+@pl.jit
+def aic_workspace_mmad_test(
+    activation: pl.Tensor[[M, AIC_MMAD_K], pl.INT8],
+    workspace: pl.Tensor[[AIC_MMAD_WORKSPACE_BYTES], pl.INT8],
+    output: pl.Out[pl.Tensor[[AIC_MMAD_OUTPUT_BYTES], pl.INT8]],
+):
+    # The two prefilled workspace stages cover K=1024 exactly.  AIV only
+    # produces the stock readiness flags; AIC executes the real BlockMmad.
+    with pl.spmd(BLOCK_DIM, name_hint="aic_workspace_mmad", sync_start=True):
+        output = aic_workspace_mmad_cce(output, activation, workspace)
+    return output
 
 
 @pl.jit
@@ -423,6 +454,100 @@ def build_tilecast_specs():
     ]
 
 
+def _aic_mmad_inputs():
+    import torch
+
+    m = torch.arange(M, dtype=torch.int16)[:, None]
+    k = torch.arange(AIC_MMAD_K, dtype=torch.int16)[None, :]
+    activation = (((3 * m + 5 * k + 1) % 7) - 3).to(torch.int8)
+
+    k = torch.arange(AIC_MMAD_K, dtype=torch.int16)[:, None]
+    n = torch.arange(N, dtype=torch.int16)[None, :]
+    weight = (((7 * k + 3 * n + 2) % 9) - 4).to(torch.int8)
+    return activation, weight
+
+
+def build_aic_mmad_specs():
+    import torch
+    from golden import TensorSpec
+
+    activation, weight = _aic_mmad_inputs()
+    workspace = torch.zeros(
+        BLOCK_DIM, STAGES, L1_K, L1_N, dtype=torch.int8
+    )
+    for block_idx in range(16):
+        n0 = block_idx * L1_N
+        workspace[block_idx, 0] = weight[:L1_K, n0 : n0 + L1_N]
+        workspace[block_idx, 1] = weight[L1_K:, n0 : n0 + L1_N]
+    workspace = workspace.flatten().contiguous()
+
+    return [
+        TensorSpec(
+            "activation",
+            [M, AIC_MMAD_K],
+            torch.int8,
+            init_value=lambda: activation,
+        ),
+        TensorSpec(
+            "aic_mmad_workspace",
+            [AIC_MMAD_WORKSPACE_BYTES],
+            torch.int8,
+            init_value=lambda: workspace,
+        ),
+        TensorSpec(
+            "aic_mmad_output",
+            [AIC_MMAD_OUTPUT_BYTES],
+            torch.int8,
+            is_output=True,
+        ),
+    ]
+
+
+def golden_aic_mmad(tensors):
+    import torch
+
+    output = tensors["aic_mmad_output"]
+    output.zero_()
+    marker = output[:MARKER_BYTES].view(torch.int32).reshape(
+        MARKER_ROWS, MARKER_COLUMNS
+    )
+    for block_idx in range(BLOCK_DIM):
+        active = block_idx < 16
+        marker[block_idx, :11] = torch.tensor(
+            [1, block_idx, -1, 1, 1, 1, int(active), 1, 0, 1, 1],
+            dtype=torch.int32,
+        )
+        for lane in range(2):
+            row = BLOCK_DIM + block_idx * 2 + lane
+            rounds = [1, 1] if active else [-1, -1]
+            marker[row, :11] = torch.tensor(
+                [
+                    2,
+                    block_idx,
+                    lane,
+                    1,
+                    1,
+                    *rounds,
+                    1,
+                    1,
+                    int(active),
+                    1,
+                ],
+                dtype=torch.int32,
+            )
+
+    workspace = tensors["aic_mmad_workspace"].reshape(
+        BLOCK_DIM, STAGES, L1_K, L1_N
+    )
+    weight = torch.empty(AIC_MMAD_K, N, dtype=torch.int8)
+    for block_idx in range(16):
+        n0 = block_idx * L1_N
+        weight[:L1_K, n0 : n0 + L1_N] = workspace[block_idx, 0]
+        weight[L1_K:, n0 : n0 + L1_N] = workspace[block_idx, 1]
+    matrix_out = output[MARKER_BYTES:].view(torch.int32).reshape(M, N)
+    matrix_out[:] = _golden_matmul(tensors["activation"], weight)
+
+
 def golden_tilecast(tensors):
     import torch
 
@@ -636,6 +761,7 @@ if __name__ == "__main__":
             "blockmmad",
             "pingpong",
             "tilecast",
+            "aicmmad",
         ),
         required=True,
     )
@@ -652,9 +778,12 @@ if __name__ == "__main__":
     is_blockmmad = args.variant == "blockmmad"
     is_pingpong = args.variant == "pingpong"
     is_tilecast = args.variant == "tilecast"
+    is_aicmmad = args.variant == "aicmmad"
     result = run_jit(
         fn=(
-            tilecast_data_test
+            aic_workspace_mmad_test
+            if is_aicmmad
+            else tilecast_data_test
             if is_tilecast
             else pingpong_state_test
             if is_pingpong
@@ -671,7 +800,9 @@ if __name__ == "__main__":
             else int8_w2_test
         ),
         specs=(
-            build_tilecast_specs()
+            build_aic_mmad_specs()
+            if is_aicmmad
+            else build_tilecast_specs()
             if is_tilecast
             else build_pingpong_specs()
             if is_pingpong
@@ -688,7 +819,9 @@ if __name__ == "__main__":
             else build_int8_specs()
         ),
         golden_fn=(
-            golden_tilecast
+            golden_aic_mmad
+            if is_aicmmad
+            else golden_tilecast
             if is_tilecast
             else golden_pingpong
             if is_pingpong
