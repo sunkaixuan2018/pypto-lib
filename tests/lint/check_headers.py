@@ -41,6 +41,7 @@ def get_git_tracked_files(root: Path) -> list[Path]:
 
 
 def is_excluded(rel: str) -> bool:
+    rel = rel.replace("\\", "/")
     return any(rel.startswith(prefix) for prefix in EXCLUDED_PREFIXES) or any(
         suffix in rel for suffix in EXCLUDED_SUFFIXES
     )
