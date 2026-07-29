@@ -38,6 +38,7 @@ WORKSPACE_BYTES = STAGES * L1_K * L1_N * BLOCK_DIM
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _KERNEL_DIR = Path(__file__).parent / "kernels" / "w4a8_w2"
 _ENTRY = _KERNEL_DIR / "entry.cpp"
+_TOPOLOGY_ENTRY = _KERNEL_DIR / "topology_entry.cpp"
 _CATLASS_INCLUDE = _REPO_ROOT / "third_party" / "catlass" / "include"
 
 
@@ -77,6 +78,27 @@ def w4a8_w2_cce(
     packed_weight_kn: pl.Tensor,
     workspace: pl.InOut[pl.Tensor],
 ) -> pl.Tensor: ...
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_TOPOLOGY_ENTRY,
+    aiv_source=_TOPOLOGY_ENTRY,
+    include_dirs=_EXTERN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def mixed_topology_cce(topology: pl.Out[pl.Tensor]) -> pl.Tensor: ...
+
+
+@pl.jit
+def mixed_topology_test(
+    topology: pl.Out[pl.Tensor[[BLOCK_DIM * 3, 8], pl.INT32]],
+):
+    # One row per AIC and per AIV lane.  The CCE probe records both PyPTO's
+    # logical task identity and CANN's native topology view.
+    with pl.spmd(BLOCK_DIM, name_hint="mixed_topology", sync_start=True):
+        topology = mixed_topology_cce(topology)
+    return topology
 
 
 @pl.jit
@@ -183,6 +205,60 @@ def build_int8_specs():
     ]
 
 
+def build_topology_specs():
+    import torch
+    from golden import TensorSpec
+
+    return [
+        TensorSpec(
+            "topology",
+            [BLOCK_DIM * 3, 8],
+            torch.int32,
+            is_output=True,
+        ),
+    ]
+
+
+def golden_topology(tensors):
+    import torch
+
+    expected = torch.zeros(BLOCK_DIM * 3, 8, dtype=torch.int32)
+    for block_idx in range(BLOCK_DIM):
+        expected[block_idx, :4] = torch.tensor(
+            [1, block_idx, BLOCK_DIM, -1], dtype=torch.int32
+        )
+        for lane in range(2):
+            row = BLOCK_DIM + block_idx * 2 + lane
+            expected[row, :4] = torch.tensor(
+                [2, block_idx, BLOCK_DIM, lane], dtype=torch.int32
+            )
+    tensors["topology"][:] = expected
+
+
+def compare_topology(actual, expected, **_):
+    import json
+    import torch
+
+    # Preserve the raw native CANN topology in the task log even when its
+    # numbering differs from PyPTO's logical persistent-task identity.
+    print("TOPOLOGY_COLUMNS=engine,logical_idx,logical_num,logical_lane,"
+          "native_idx,native_num,native_lane,native_lanes")
+    print("TOPOLOGY_RAW=" + json.dumps(actual.cpu().tolist(), separators=(",", ":")))
+
+    logical_actual = actual[:, :4].cpu()
+    logical_expected = expected[:, :4].cpu()
+    if torch.equal(logical_actual, logical_expected):
+        return True, ""
+    mismatches = torch.nonzero(logical_actual != logical_expected)
+    details = []
+    for row, col in mismatches[:16].tolist():
+        details.append(
+            f"[{row},{col}] actual={logical_actual[row, col].item()} "
+            f"expected={logical_expected[row, col].item()}"
+        )
+    return False, "logical MIX topology mismatch:\n" + "\n".join(details)
+
+
 def golden_w4(tensors):
     tensors["out"][:] = _golden_matmul(
         tensors["activation"], _unpack_int4_kn(tensors["packed_weight_kn"])
@@ -200,7 +276,9 @@ if __name__ == "__main__":
     from golden import run_jit
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--variant", choices=("w4a8", "int8"), required=True)
+    parser.add_argument(
+        "--variant", choices=("w4a8", "int8", "topology"), required=True
+    )
     parser.add_argument("-p", "--platform", default="a2a3", choices=("a2a3", "a2a3sim"))
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
@@ -208,10 +286,29 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     is_w4 = args.variant == "w4a8"
+    is_topology = args.variant == "topology"
     result = run_jit(
-        fn=w4a8_w2_test if is_w4 else int8_w2_test,
-        specs=build_w4_specs() if is_w4 else build_int8_specs(),
-        golden_fn=golden_w4 if is_w4 else golden_int8,
+        fn=(
+            mixed_topology_test
+            if is_topology
+            else w4a8_w2_test
+            if is_w4
+            else int8_w2_test
+        ),
+        specs=(
+            build_topology_specs()
+            if is_topology
+            else build_w4_specs()
+            if is_w4
+            else build_int8_specs()
+        ),
+        golden_fn=(
+            golden_topology
+            if is_topology
+            else golden_w4
+            if is_w4
+            else golden_int8
+        ),
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,
@@ -220,6 +317,7 @@ if __name__ == "__main__":
         ),
         rtol=0.0,
         atol=0.0,
+        compare_fn={"topology": compare_topology} if is_topology else None,
     )
     if not result.passed:
         if result.error:
