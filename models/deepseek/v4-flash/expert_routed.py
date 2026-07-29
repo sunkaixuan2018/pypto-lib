@@ -39,7 +39,7 @@ MM_GATE_INNER = 4
 ACT_INTER_TILE = 128
 ACT_GATE_INNER = 4
 ACT_ROW_PAD = 8
-ACT_ROWS_PER_BLOCK = 2
+ACT_ROWS_PER_BLOCK = 8
 D_OUT_TILE = 256
 # h_tile_i8 store innermost = QUANT_TILE bytes (int8); 512 hits the a2a3 L2 cache
 # line (perf_hint PH001 flagged the prior 256B store as sub-line).
