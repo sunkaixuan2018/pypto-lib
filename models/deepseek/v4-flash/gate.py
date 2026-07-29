@@ -198,10 +198,7 @@ def gate(
             hp_sum_tmp = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
             hp_logit = pl.row_sum(hp_reduce, hp_sum_tmp)
             hp_logit = pl.set_validshape(pl.reshape(hp_logit, [1, ROW_PAD]), 1, 1)
-            hp_logit = pl.mul(
-                hp_logit,
-                pl.tile.load(inv_rms_buf, [hp_t, 0], [1, 1]),
-            )
+            hp_logit = pl.mul(hp_logit, pl.read(inv_rms_buf, [hp_t, 0]))
 
             hp_relu = pl.maximum(hp_logit, 0.0)
             hp_abs = pl.maximum(hp_logit, pl.neg(hp_logit))
@@ -270,7 +267,7 @@ def gate(
             name_hint="route_hash_sparse",
             allow_early_resolve=True,
         ):
-            hs_vals_pad = pl.tile.full([1, TOPK_PAD], dtype=pl.FP32, value=0.0)
+            hs_vals_pad = pl.tile.full([ROW_PAD, TOPK_PAD], dtype=pl.FP32, value=0.0)
             hs_token = pl.cast(pl.read(input_ids, [th_idx]), pl.INDEX)
             for hs_k in pl.range(TOPK):
                 hp_idx = th_idx * TOPK + hs_k
@@ -284,11 +281,18 @@ def gate(
                     [th_idx, hs_k],
                     pl.read(tid2eid, [hs_token, hs_k]),
                 )
-            hs_denom_tmp = pl.create_tile([1, TOPK_PAD], dtype=pl.FP32)
-            hs_denom = pl.reshape(pl.row_sum(hs_vals_pad, hs_denom_tmp), [1, 1])
-            hs_weights_pad = pl.mul(pl.row_expand_div(hs_vals_pad, hs_denom), ROUTE_SCALE)
+            hs_vals_pad = pl.set_validshape(hs_vals_pad, 1, TOPK_PAD)
+            hs_denom_tmp = pl.create_tile([ROW_PAD, TOPK_PAD], dtype=pl.FP32)
+            hs_denom_tile = pl.row_sum(hs_vals_pad, hs_denom_tmp)
+            hs_denom = pl.read(hs_denom_tile, [0, 0])
             for hs_k in pl.range(TOPK):
-                pl.write(weights, [th_idx, hs_k], pl.read(hs_weights_pad, [0, hs_k]))
+                hp_idx = th_idx * TOPK + hs_k
+                hs_score = pl.read(hash_scores_buf, [hp_idx, 0])
+                pl.write(
+                    weights,
+                    [th_idx, hs_k],
+                    pl.mul(pl.div(hs_score, hs_denom), ROUTE_SCALE),
+                )
     else:
         for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=True):
             t1 = ts_idx * GATE_T_TILE
