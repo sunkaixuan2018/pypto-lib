@@ -69,6 +69,34 @@ def _cann_include_dirs() -> tuple[Path, ...]:
 _EXTERN_INCLUDE_DIRS = (_CATLASS_INCLUDE, _KERNEL_DIR) + _cann_include_dirs()
 _GATE_ENTRY = _KERNEL_DIR / "gate_entry.cpp"
 _W2_ENTRY = _KERNEL_DIR / "w2_entry.cpp"
+_SPLIT_GATE_ENTRY = _KERNEL_DIR / "split_gate_entry.cpp"
+_SPLIT_W2_ENTRY = _KERNEL_DIR / "split_w2_entry.cpp"
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_SPLIT_GATE_ENTRY,
+    aiv_source=_SPLIT_GATE_ENTRY,
+    include_dirs=_EXTERN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def gate_split_msd_cce(
+    packed_planes: pl.Out[pl.Tensor],
+    activation: pl.Tensor,
+) -> pl.Tensor: ...
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_SPLIT_W2_ENTRY,
+    aiv_source=_SPLIT_W2_ENTRY,
+    include_dirs=_EXTERN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def w2_split_msd_cce(
+    packed_planes: pl.Out[pl.Tensor],
+    activation: pl.Tensor,
+) -> pl.Tensor: ...
 
 
 @pl.jit.extern(
@@ -101,11 +129,18 @@ def w2_i4_msd_cce(
 
 @pl.jit
 def gate_msd_packed(
-    packed_planes: pl.Tensor[[PLANES_M, GATE_K // 2], pl.INT8],
+    activation: pl.Tensor[[M, GATE_K], pl.INT8],
     packed_weight: pl.Tensor[[GATE_N, GATE_K // 2], pl.INT8],
     sum_weight: pl.Tensor[[GATE_N], pl.INT32],
     out: pl.Out[pl.Tensor[[M, GATE_N], pl.INT32]],
 ):
+    packed_planes = pl.create_tensor(
+        [PLANES_M, GATE_K // 2], dtype=pl.INT8
+    )
+    with pl.spmd(GATE_BLOCKS, name_hint="gate_split_msd"):
+        packed_planes = gate_split_msd_cce(
+            packed_planes, activation
+        )
     acc_planes = pl.create_tensor([PLANES_M, GATE_N], dtype=pl.INT32)
     with pl.spmd(GATE_BLOCKS, name_hint="gate_i4_msd"):
         acc_planes = gate_i4_msd_cce(
@@ -131,11 +166,18 @@ def gate_msd_packed(
 
 @pl.jit
 def w2_msd_packed(
-    packed_planes: pl.Tensor[[PLANES_M, W2_K // 2], pl.INT8],
+    activation: pl.Tensor[[M, W2_K], pl.INT8],
     packed_weight: pl.Tensor[[W2_N, W2_K // 2], pl.INT8],
     sum_weight: pl.Tensor[[W2_N], pl.INT32],
     out: pl.Out[pl.Tensor[[M, W2_N], pl.INT32]],
 ):
+    packed_planes = pl.create_tensor(
+        [PLANES_M, W2_K // 2], dtype=pl.INT8
+    )
+    with pl.spmd(W2_BLOCKS, name_hint="w2_split_msd"):
+        packed_planes = w2_split_msd_cce(
+            packed_planes, activation
+        )
     acc_planes = pl.create_tensor([PLANES_M, W2_N], dtype=pl.INT32)
     with pl.spmd(W2_BLOCKS, name_hint="w2_i4_msd"):
         acc_planes = w2_i4_msd_cce(
@@ -176,11 +218,6 @@ def build_specs(k: int, n: int):
     activation = (((11 * row + 17 * col + 3) % 256) - 128).to(
         torch.int8
     )
-    activation_u = activation.to(torch.int16) + 128
-    hi = (activation_u // 16 - 8).to(torch.int8)
-    lo = (activation_u % 16 - 8).to(torch.int8)
-    packed_planes = _pack_signed_int4(torch.cat([hi, lo], dim=0))
-
     out_col = torch.arange(n, dtype=torch.int16)[:, None]
     in_col = torch.arange(k, dtype=torch.int16)[None, :]
     weight = (((7 * out_col + 3 * in_col + 2) % 16) - 8).to(
@@ -194,8 +231,8 @@ def build_specs(k: int, n: int):
 
     return [
         TensorSpec(
-            "packed_planes", [PLANES_M, k // 2], torch.int8,
-            init_value=lambda: packed_planes,
+            "activation", [M, k], torch.int8,
+            init_value=lambda: activation,
         ),
         TensorSpec(
             "packed_weight", [n, k // 2], torch.int8,
