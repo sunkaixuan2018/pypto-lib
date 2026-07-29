@@ -42,7 +42,6 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from config import FLASH as M, EP_WORLD_SIZE, MOE_TOKENS, RECV_MAX
 from hc_pre import hc_pre
-from hc_post import hc_post
 from gate import gate
 from expert_shared import expert_shared
 from expert_routed import expert_routed
@@ -336,7 +335,10 @@ def combine(
     recv_y: pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.BF16],
     recv_r_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
     sh: pl.Tensor[[T, D], pl.BF16],
-    ffn_out: pl.Tensor[[T, D], pl.BF16],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    post_ffn: pl.Tensor[[T, HC_MULT], pl.FP32],
+    comb_ffn: pl.Tensor[[T, HC_MULT * HC_MULT], pl.FP32],
+    x_next: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     recv_meta_local: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[T * TOPK, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -403,29 +405,48 @@ def combine(
                     cmp=pld.WaitCmp.Ge,
                 )
 
-    # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k]. deps on combine_wait for the
-    # peers' writes; this rank's own puts ride the local RAW edge on routed_y_buf,
-    # which is the only thing ordering them now that the wait is off the scatter.
+    # Fuse routed/shared reduction with hc_post. The old path wrote one BF16
+    # ffn_out row to GM, launched a second task, and read that row four times.
+    # One block now owns one token: it computes/rounds the FFN row once, reuses it
+    # for all HC outputs, and writes x_next directly.
+    #
+    # deps on combine_wait orders remote writes; this rank's own puts ride the
+    # local RAW edge on routed_y_buf.
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
+
+    residual_flat = pl.reshape(x_hc, [T, HC_MULT * D])
+    x_next_flat = pl.reshape(x_next, [T, HC_MULT * D])
     with pl.spmd(
         T,
-        name_hint="shared_routed",
+        name_hint="shared_routed_hc_post",
         deps=[_cwait_tid],
         allow_early_resolve=True,
-    ) as _reduce_tid:
+    ):
         t = pl.tile.get_block_idx()
+        acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
         if t < active_tokens:
-            acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
             for k in pl.range(TOPK):
                 r = t * TOPK + k
                 acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
-            ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
-        else:
-            ffn_out[t:t + 1, :] = sh[t:t + 1, :]
+
+        # Preserve the old BF16 boundary exactly, but keep it on-chip instead of
+        # materializing ffn_out in GM.
+        ffn_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
+        ffn_fp32 = pl.cast(ffn_bf16, target_type=pl.FP32)
+        for out_h in pl.pipeline(HC_MULT, stage=2):
+            post_w = pl.read(post_ffn, [t, out_h])
+            y_row = pl.mul(ffn_fp32, post_w)
+            for in_h in pl.pipeline(HC_MULT, stage=4):
+                comb_w = pl.read(comb_ffn, [t, in_h * HC_MULT + out_h])
+                res_d = in_h * D
+                residual_row = residual_flat[t:t + 1, res_d:res_d + D]
+                y_row = pl.add(y_row, pl.mul(residual_row, comb_w))
+            out_d = out_h * D
+            x_next_flat[t:t + 1, out_d:out_d + D] = y_row
 
 
 @pl.jit.inline(auto_scope=False)
@@ -519,15 +540,13 @@ def moe(
             recv_y,
         )
 
-        ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
         combine(
             recv_y, recv_r_route_out, sh,
-            ffn_out, recv_meta_local,
+            x_hc, post_ffn, comb_ffn, x_next,
+            recv_meta_local,
             routed_y_buf, combine_arrived,
             num_tokens, my_rank, moe_epoch,
         )
-
-        hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
     return x_next
 
 
