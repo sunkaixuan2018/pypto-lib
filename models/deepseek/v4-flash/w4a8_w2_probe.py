@@ -34,6 +34,8 @@ L1_K = 512
 L1_N = 256
 STAGES = 2
 WORKSPACE_BYTES = STAGES * L1_K * L1_N * BLOCK_DIM
+BATCHED_EXPERTS = 16
+BATCHED_ROWS = 16
 MARKER_ROWS = BLOCK_DIM * 3
 MARKER_COLUMNS = 16
 MARKER_BYTES = MARKER_ROWS * MARKER_COLUMNS * 4
@@ -61,6 +63,7 @@ _DYNAMIC_MMAD_ENTRY = _KERNEL_DIR / "dynamic_mmad_entry.cpp"
 _INTEGRATED_ENTRY = _KERNEL_DIR / "integrated_k1024_entry.cpp"
 _INTEGRATED_WRAP_ENTRY = _KERNEL_DIR / "integrated_k1536_entry.cpp"
 _INTEGRATED_FULL_ENTRY = _KERNEL_DIR / "integrated_k2048_entry.cpp"
+_BATCHED_ENTRY = _KERNEL_DIR / "batched_entry.cpp"
 _CATLASS_INCLUDE = _REPO_ROOT / "third_party" / "catlass" / "include"
 
 
@@ -98,6 +101,21 @@ def w4a8_w2_cce(
     out: pl.Out[pl.Tensor],
     activation: pl.Tensor,
     packed_weight_kn: pl.Tensor,
+    workspace: pl.InOut[pl.Tensor],
+) -> pl.Tensor: ...
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_BATCHED_ENTRY,
+    aiv_source=_BATCHED_ENTRY,
+    include_dirs=_EXTERN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def batched_w4a8_w2_cce(
+    out: pl.Out[pl.Tensor],
+    activation: pl.Tensor,
+    packed_weight_ekn: pl.Tensor,
     workspace: pl.InOut[pl.Tensor],
 ) -> pl.Tensor: ...
 
@@ -252,6 +270,29 @@ def integrated_k2048_test(
             output, activation, packed_weight_kn, workspace
         )
     return output
+
+
+@pl.jit
+def batched_w4a8_w2_test(
+    activation: pl.Tensor[
+        [BATCHED_EXPERTS, BATCHED_ROWS, K], pl.INT8
+    ],
+    packed_weight_ekn: pl.Tensor[
+        [BATCHED_EXPERTS, K, N // 2], pl.INT8
+    ],
+    workspace: pl.Tensor[[WORKSPACE_BYTES], pl.INT8],
+    out: pl.Out[
+        pl.Tensor[[BATCHED_EXPERTS, BATCHED_ROWS, N], pl.INT32]
+    ],
+):
+    # One persistent MIX launch covers all 16 local experts.  Each physical
+    # core group repeatedly claims a flattened (expert, N-tile) task while
+    # reusing its private two-stage workspace.
+    with pl.spmd(BLOCK_DIM, name_hint="batched_w4a8_w2", sync_start=True):
+        out = batched_w4a8_w2_cce(
+            out, activation, packed_weight_ekn, workspace
+        )
+    return out
 
 
 @pl.jit
@@ -426,7 +467,7 @@ def _pack_int4_kn(weight_kn):
     import torch
 
     unsigned = torch.bitwise_and(weight_kn.to(torch.int16), 0xF)
-    packed = unsigned[:, 0::2] | (unsigned[:, 1::2] << 4)
+    packed = unsigned[..., 0::2] | (unsigned[..., 1::2] << 4)
     return packed.to(torch.uint8).view(torch.int8).contiguous()
 
 
@@ -439,9 +480,11 @@ def _unpack_int4_kn(packed):
     high = (raw >> 4) & 0xF
     low = torch.where(low < 8, low, low - 16)
     high = torch.where(high < 8, high, high - 16)
-    weight = torch.empty(packed.shape[0], N, dtype=torch.int8)
-    weight[:, 0::2] = low.to(torch.int8)
-    weight[:, 1::2] = high.to(torch.int8)
+    weight = torch.empty(
+        *packed.shape[:-1], packed.shape[-1] * 2, dtype=torch.int8
+    )
+    weight[..., 0::2] = low.to(torch.int8)
+    weight[..., 1::2] = high.to(torch.int8)
     return weight
 
 
@@ -467,6 +510,58 @@ def build_w4_specs():
         TensorSpec("packed_weight_kn", [K, N // 2], torch.int8, init_value=lambda: packed),
         TensorSpec("workspace", [WORKSPACE_BYTES], torch.int8, init_value=lambda: torch.zeros(WORKSPACE_BYTES, dtype=torch.int8)),
         TensorSpec("out", [M, N], torch.int32, is_output=True),
+    ]
+
+
+def build_batched_specs():
+    import torch
+    from golden import TensorSpec
+
+    torch.manual_seed(20260729)
+    expert = torch.arange(BATCHED_EXPERTS, dtype=torch.int16)[:, None]
+    row = torch.arange(BATCHED_ROWS, dtype=torch.int16)[None, :]
+    row_factor = (((3 * expert + 5 * row + 1) % 7) - 3).to(torch.int8)
+    activation = row_factor[:, :, None].expand(
+        BATCHED_EXPERTS, BATCHED_ROWS, K
+    ).contiguous()
+
+    # Generating packed bytes directly avoids materializing a second 128 MiB
+    # logical INT4 tensor on the host.  Every low/high nibble still spans the
+    # complete signed INT4 range [-8, 7].
+    packed = torch.randint(
+        0,
+        256,
+        (BATCHED_EXPERTS, K, N // 2),
+        dtype=torch.uint8,
+    ).view(torch.int8)
+
+    return [
+        TensorSpec(
+            "activation",
+            [BATCHED_EXPERTS, BATCHED_ROWS, K],
+            torch.int8,
+            init_value=lambda: activation,
+        ),
+        TensorSpec(
+            "packed_weight_ekn",
+            [BATCHED_EXPERTS, K, N // 2],
+            torch.int8,
+            init_value=lambda: packed,
+        ),
+        TensorSpec(
+            "workspace",
+            [WORKSPACE_BYTES],
+            torch.int8,
+            init_value=lambda: torch.zeros(
+                WORKSPACE_BYTES, dtype=torch.int8
+            ),
+        ),
+        TensorSpec(
+            "out",
+            [BATCHED_EXPERTS, BATCHED_ROWS, N],
+            torch.int32,
+            is_output=True,
+        ),
     ]
 
 
@@ -1162,6 +1257,31 @@ def golden_w4(tensors):
     )
 
 
+def golden_batched(tensors):
+    import torch
+
+    packed = tensors["packed_weight_ekn"]
+    raw = packed.view(torch.uint8)
+
+    low = torch.bitwise_and(raw, 0xF).to(torch.int16)
+    low = torch.where(low < 8, low, low - 16)
+    low_sum = low.to(torch.int32).sum(dim=1)
+    del low
+
+    high = torch.bitwise_right_shift(raw, 4).to(torch.int16)
+    high = torch.where(high < 8, high, high - 16)
+    high_sum = high.to(torch.int32).sum(dim=1)
+    del high
+
+    weight_sum = torch.empty(
+        BATCHED_EXPERTS, N, dtype=torch.int32
+    )
+    weight_sum[:, 0::2] = low_sum
+    weight_sum[:, 1::2] = high_sum
+    row_factor = tensors["activation"][:, :, 0].to(torch.int32)
+    tensors["out"][:] = row_factor[:, :, None] * weight_sum[:, None, :]
+
+
 def golden_int8(tensors):
     tensors["out"][:] = _golden_matmul(
         tensors["activation"], tensors["weight_nk"].T.contiguous()
@@ -1176,6 +1296,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--variant",
         choices=(
+            "batched",
             "w4a8",
             "int8",
             "topology",
@@ -1198,6 +1319,7 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true")
     args = parser.parse_args()
 
+    is_batched = args.variant == "batched"
     is_w4 = args.variant == "w4a8"
     is_topology = args.variant == "topology"
     is_crosscore = args.variant == "crosscore"
@@ -1212,7 +1334,9 @@ if __name__ == "__main__":
     is_integrated_full = args.variant == "integrated2048"
     result = run_jit(
         fn=(
-            integrated_k2048_test
+            batched_w4a8_w2_test
+            if is_batched
+            else integrated_k2048_test
             if is_integrated_full
             else integrated_k1536_test
             if is_integrated_wrap
@@ -1239,7 +1363,9 @@ if __name__ == "__main__":
             else int8_w2_test
         ),
         specs=(
-            build_integrated_full_specs()
+            build_batched_specs()
+            if is_batched
+            else build_integrated_full_specs()
             if is_integrated_full
             else build_integrated_wrap_specs()
             if is_integrated_wrap
@@ -1266,7 +1392,9 @@ if __name__ == "__main__":
             else build_int8_specs()
         ),
         golden_fn=(
-            golden_integrated_full
+            golden_batched
+            if is_batched
+            else golden_integrated_full
             if is_integrated_full
             else golden_integrated_wrap
             if is_integrated_wrap
