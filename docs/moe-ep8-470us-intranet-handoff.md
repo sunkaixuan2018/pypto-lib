@@ -26,13 +26,13 @@
 | --- | --- |
 | 仓库 | `https://github.com/sunkaixuan2018/pypto-lib.git` |
 | 分支 | `skx/optimize-moe` |
-| 当前提交 | `262d69448b0a87376e0896744c74fe36984eee86` |
+| 当前 MoE 代码提交 | `262d69448b0a87376e0896744c74fe36984eee86` |
 | 上游基点 | `a46139a`，来自 `hw-native-sys/pypto-lib` main |
 | 性能基线提交 | `2c7392af841531f43db69cded522631c7bfaaa1f` |
 | 当前候选状态 | 恢复基线 tile，仅将 gate/up pipeline 从 `stage=2` 改为 `stage=1` |
 
-2026-07-29 已通过 `git ls-remote` 确认远端
-`skx/optimize-moe` 指向 `262d69448b0a87376e0896744c74fe36984eee86`。
+`262d694` 是需要复现的 MoE 代码版本；后续提交只增加本交接文档，
+没有再修改 MoE 实现。
 
 主要代码变化：
 
