@@ -42,6 +42,7 @@ _TOPOLOGY_ENTRY = _KERNEL_DIR / "topology_entry.cpp"
 _CROSSCORE_ENTRY = _KERNEL_DIR / "crosscore_entry.cpp"
 _RESOURCE_ENTRY = _KERNEL_DIR / "resource_entry.cpp"
 _BLOCKMMAD_ENTRY = _KERNEL_DIR / "blockmmad_entry.cpp"
+_PINGPONG_ENTRY = _KERNEL_DIR / "pingpong_entry.cpp"
 _CATLASS_INCLUDE = _REPO_ROOT / "third_party" / "catlass" / "include"
 
 
@@ -121,6 +122,27 @@ def resource_lifecycle_cce(lifecycle: pl.Out[pl.Tensor]) -> pl.Tensor: ...
     dual_aiv_dispatch=True,
 )
 def blockmmad_lifecycle_cce(lifecycle: pl.Out[pl.Tensor]) -> pl.Tensor: ...
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_PINGPONG_ENTRY,
+    aiv_source=_PINGPONG_ENTRY,
+    include_dirs=_EXTERN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def pingpong_state_cce(state: pl.Out[pl.Tensor]) -> pl.Tensor: ...
+
+
+@pl.jit
+def pingpong_state_test(
+    state: pl.Out[pl.Tensor[[BLOCK_DIM * 3, 16], pl.INT32]],
+):
+    # Reproduce the exact two-stage, four-generation W4 CrossCore protocol
+    # without data movement or MMAD.
+    with pl.spmd(BLOCK_DIM, name_hint="pingpong_state", sync_start=True):
+        state = pingpong_state_cce(state)
+    return state
 
 
 @pl.jit
@@ -327,6 +349,66 @@ def build_blockmmad_specs():
     ]
 
 
+def build_pingpong_specs():
+    import torch
+    from golden import TensorSpec
+
+    return [
+        TensorSpec(
+            "pingpong_state",
+            [BLOCK_DIM * 3, 16],
+            torch.int32,
+            is_output=True,
+        ),
+    ]
+
+
+def golden_pingpong(tensors):
+    import torch
+
+    # engine, block, lane, before, ctor, rounds 0..3, dtor-enter/done,
+    # resource-dtor, base-mod-64, active
+    expected = torch.zeros(BLOCK_DIM * 3, 16, dtype=torch.int32)
+    for block_idx in range(BLOCK_DIM):
+        active = block_idx < 16
+        rounds = [1, 1, 1, 1] if active else [-1, -1, -1, -1]
+        expected[block_idx, :14] = torch.tensor(
+            [
+                1,
+                block_idx,
+                -1,
+                1,
+                1,
+                *rounds,
+                1,
+                1,
+                1,
+                0,
+                int(active),
+            ],
+            dtype=torch.int32,
+        )
+        for lane in range(2):
+            row = BLOCK_DIM + block_idx * 2 + lane
+            expected[row, :14] = torch.tensor(
+                [
+                    2,
+                    block_idx,
+                    lane,
+                    1,
+                    1,
+                    *rounds,
+                    1,
+                    1,
+                    1,
+                    0,
+                    int(active),
+                ],
+                dtype=torch.int32,
+            )
+    tensors["pingpong_state"][:] = expected
+
+
 def golden_blockmmad(tensors):
     import torch
 
@@ -445,6 +527,7 @@ if __name__ == "__main__":
             "crosscore",
             "resource",
             "blockmmad",
+            "pingpong",
         ),
         required=True,
     )
@@ -459,9 +542,12 @@ if __name__ == "__main__":
     is_crosscore = args.variant == "crosscore"
     is_resource = args.variant == "resource"
     is_blockmmad = args.variant == "blockmmad"
+    is_pingpong = args.variant == "pingpong"
     result = run_jit(
         fn=(
-            blockmmad_lifecycle_test
+            pingpong_state_test
+            if is_pingpong
+            else blockmmad_lifecycle_test
             if is_blockmmad
             else resource_lifecycle_test
             if is_resource
@@ -474,7 +560,9 @@ if __name__ == "__main__":
             else int8_w2_test
         ),
         specs=(
-            build_blockmmad_specs()
+            build_pingpong_specs()
+            if is_pingpong
+            else build_blockmmad_specs()
             if is_blockmmad
             else build_resource_specs()
             if is_resource
@@ -487,7 +575,9 @@ if __name__ == "__main__":
             else build_int8_specs()
         ),
         golden_fn=(
-            golden_blockmmad
+            golden_pingpong
+            if is_pingpong
+            else golden_blockmmad
             if is_blockmmad
             else golden_resource
             if is_resource
