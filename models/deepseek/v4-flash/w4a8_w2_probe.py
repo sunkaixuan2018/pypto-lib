@@ -1,0 +1,203 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Standalone W2-shaped W4A8 feasibility probe for the EP8 decode MoE.
+
+This deliberately does not change the production MoE path.  It compares:
+
+* the current INT8 x INT8 W2 shape and tiling; and
+* Catlass W4A8, where packed INT4 weights are expanded by AIV into a temporary
+  INT8 workspace before the Cube matmul.
+
+Both variants compute an exact INT32 result for M=16, K=2048, N=4096.  Keeping
+the probe separate makes the first device run a strict compile/correctness and
+isolated-performance gate before we take on MoE scheduling changes.
+"""
+
+from pathlib import Path
+
+import pypto.language as pl
+
+
+M = 16
+K = 2048
+N = 4096
+BLOCK_DIM = 24
+
+L1_K = 512
+L1_N = 256
+STAGES = 2
+WORKSPACE_BYTES = STAGES * L1_K * L1_N * BLOCK_DIM
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_KERNEL_DIR = Path(__file__).parent / "kernels" / "w4a8_w2"
+_ENTRY = _KERNEL_DIR / "entry.cpp"
+_CATLASS_INCLUDE = _REPO_ROOT / "third_party" / "catlass" / "include"
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_ENTRY,
+    aiv_source=_ENTRY,
+    include_dirs=(_CATLASS_INCLUDE,),
+    dual_aiv_dispatch=True,
+)
+def w4a8_w2_cce(
+    out: pl.Out[pl.Tensor],
+    activation: pl.Tensor,
+    packed_weight_kn: pl.Tensor,
+    workspace: pl.InOut[pl.Tensor],
+) -> pl.Tensor: ...
+
+
+@pl.jit
+def w4a8_w2_test(
+    activation: pl.Tensor[[M, K], pl.INT8],
+    packed_weight_kn: pl.Tensor[[K, N // 2], pl.INT8],
+    workspace: pl.Tensor[[WORKSPACE_BYTES], pl.INT8],
+    out: pl.Out[pl.Tensor[[M, N], pl.INT32]],
+):
+    # Catlass uses the hardware full-die block/sub-block ids.  A full-occupancy,
+    # co-started task therefore matches its 24 AIC + 48 AIV scheduling contract.
+    with pl.spmd(BLOCK_DIM, name_hint="w4a8_w2", sync_start=True):
+        out = w4a8_w2_cce(out, activation, packed_weight_kn, workspace)
+    return out
+
+
+@pl.jit
+def int8_w2_test(
+    activation: pl.Tensor[[M, K], pl.INT8],
+    weight_nk: pl.Tensor[[N, K], pl.INT8],
+    out: pl.Out[pl.Tensor[[M, N], pl.INT32]],
+):
+    # Match the current production W2 split: 4 blocks, 4 x 256 output channels
+    # per block, K=512 ping-pong pipeline.
+    with pl.spmd(4, name_hint="int8_w2"):
+        block_idx = pl.tile.get_block_idx()
+        n_base = block_idx * 4 * 256
+        for inner in pl.range(4):
+            n0 = n_base + inner * 256
+            acc = pl.create_tensor([1, M, 256], dtype=pl.INT32)
+            for k0 in pl.pipeline(0, K, 512, stage=2):
+                a_k = activation[:, k0 : k0 + 512]
+                b_k = weight_nk[n0 : n0 + 256, k0 : k0 + 512]
+                if k0 == 0:
+                    acc = pl.matmul(a_k, b_k, b_trans=True, out_dtype=pl.INT32)
+                else:
+                    acc = pl.matmul_acc(acc, a_k, b_k, b_trans=True)
+            out[:, n0 : n0 + 256] = pl.reshape(acc, [M, 256])
+    return out
+
+
+def _pack_int4_kn(weight_kn):
+    """Pack adjacent N values as low/high signed nibbles."""
+    import torch
+
+    unsigned = torch.bitwise_and(weight_kn.to(torch.int16), 0xF)
+    packed = unsigned[:, 0::2] | (unsigned[:, 1::2] << 4)
+    return packed.to(torch.uint8).view(torch.int8).contiguous()
+
+
+def _unpack_int4_kn(packed):
+    """Inverse of :func:`_pack_int4_kn`, used by the independent golden."""
+    import torch
+
+    raw = packed.view(torch.uint8).to(torch.int16)
+    low = raw & 0xF
+    high = (raw >> 4) & 0xF
+    low = torch.where(low < 8, low, low - 16)
+    high = torch.where(high < 8, high, high - 16)
+    weight = torch.empty(K, N, dtype=torch.int8)
+    weight[:, 0::2] = low.to(torch.int8)
+    weight[:, 1::2] = high.to(torch.int8)
+    return weight
+
+
+def _golden_matmul(activation, weight_kn):
+    # Every exact accumulation is below 2**24 for this probe, so float32 matmul
+    # is an exact and much faster CPU reference than a Python integer loop.
+    import torch
+
+    return (activation.float() @ weight_kn.float()).to(torch.int32)
+
+
+def build_w4_specs():
+    import torch
+    from golden import TensorSpec
+
+    torch.manual_seed(20260729)
+    activation = torch.randint(-127, 128, (M, K), dtype=torch.int8)
+    weight_kn = torch.randint(-8, 8, (K, N), dtype=torch.int8)
+    packed = _pack_int4_kn(weight_kn)
+
+    return [
+        TensorSpec("activation", [M, K], torch.int8, init_value=lambda: activation),
+        TensorSpec("packed_weight_kn", [K, N // 2], torch.int8, init_value=lambda: packed),
+        TensorSpec("workspace", [WORKSPACE_BYTES], torch.int8, init_value=lambda: torch.zeros(WORKSPACE_BYTES, dtype=torch.int8)),
+        TensorSpec("out", [M, N], torch.int32, is_output=True),
+    ]
+
+
+def build_int8_specs():
+    import torch
+    from golden import TensorSpec
+
+    torch.manual_seed(20260729)
+    activation = torch.randint(-127, 128, (M, K), dtype=torch.int8)
+    # Use the same numeric W4 range so only storage/prologue/scheduling differ.
+    weight_nk = torch.randint(-8, 8, (N, K), dtype=torch.int8)
+
+    return [
+        TensorSpec("activation", [M, K], torch.int8, init_value=lambda: activation),
+        TensorSpec("weight_nk", [N, K], torch.int8, init_value=lambda: weight_nk),
+        TensorSpec("out", [M, N], torch.int32, is_output=True),
+    ]
+
+
+def golden_w4(tensors):
+    tensors["out"][:] = _golden_matmul(
+        tensors["activation"], _unpack_int4_kn(tensors["packed_weight_kn"])
+    )
+
+
+def golden_int8(tensors):
+    tensors["out"][:] = _golden_matmul(
+        tensors["activation"], tensors["weight_nk"].T.contiguous()
+    )
+
+
+if __name__ == "__main__":
+    import argparse
+    from golden import run_jit
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--variant", choices=("w4a8", "int8"), required=True)
+    parser.add_argument("-p", "--platform", default="a2a3", choices=("a2a3", "a2a3sim"))
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--dump-passes", action="store_true")
+    args = parser.parse_args()
+
+    is_w4 = args.variant == "w4a8"
+    result = run_jit(
+        fn=w4a8_w2_test if is_w4 else int8_w2_test,
+        specs=build_w4_specs() if is_w4 else build_int8_specs(),
+        golden_fn=golden_w4 if is_w4 else golden_int8,
+        compile_cfg=dict(dump_passes=args.dump_passes),
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
+        ),
+        rtol=0.0,
+        atol=0.0,
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)
