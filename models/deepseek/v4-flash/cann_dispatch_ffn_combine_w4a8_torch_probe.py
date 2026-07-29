@@ -12,13 +12,18 @@ from __future__ import annotations
 
 import os
 import statistics
+import sys
 import time
 from pathlib import Path
 
+import numpy
+import scipy
 import torch
 import torch.distributed as dist
 import torch_npu
 from torch.distributed.distributed_c10d import _get_default_group
+
+torch_npu.npu.config.allow_internal_format = True
 
 WORLD_SIZE = 8
 TOKENS = 8
@@ -134,7 +139,10 @@ def main() -> None:
     free_after, _ = torch.npu.mem_get_info()
     print(
         f"rank={rank} local_rank={local_rank} group={group} "
+        f"python={sys.version.split()[0]} numpy={numpy.__version__} "
+        f"scipy={scipy.__version__} "
         f"torch={torch.__version__} torch_npu={torch_npu.__version__} "
+        f"allow_internal_format={torch_npu.npu.config.allow_internal_format} "
         f"extension={extension} free_before={free_before} "
         f"free_after={free_after} total_hbm={total_hbm}",
         flush=True,
