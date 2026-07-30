@@ -161,6 +161,73 @@ artifacts/moe-ep8-early-resolve-restored-20260730/
   moe_ep8_baseline_control_20260730.log
 ```
 
+## Exact fused-W13 tiling and source-level extern probe
+
+The corrected custom operator was instrumented in an isolated source tree to
+dump the complete fusion tiling for the same `M=256, K=N=4096, E=16` W8A8
+shape. The host-selected topology is 24 Cube blocks and 48 Vector blocks. Its
+main Cube tile is:
+
+```text
+singleCoreM=256, singleCoreN=256, singleCoreK=4096
+baseM=128, baseN=256, baseK=128
+depthA1=8, depthB1=8, stepKa=4, stepKb=4
+dbL0A=2, dbL0B=2, dbL0C=1
+shareL1Size=98304, shareL0CSize=131072
+```
+
+The remaining fusion fields are:
+
+```text
+groupNum=16, ubFactorDimx=4, ubFactorDimy=2048
+actRight=0, groupListType=0, isSingleTensor=1, swigluLimit=10
+```
+
+All recorded layout fields are zero, and the matmul batch fields are one. The
+diagnostic task was `task_20260730_041256_101367718490`. Its timing includes
+per-call host logging and is not performance evidence.
+
+A source-level `pl.jit.extern` probe then reproduced the fixed tiling and raw
+single-tensor ABI. The first compile attempt reached the CCE wrapper and failed
+only on eight typed-pointer to `GM_ADDR` conversions. Commit `0fe4ce7` fixed
+those conversions; the wrapper then compiled in 1.16 seconds and entered
+device runtime.
+
+The device did not make forward progress. After 60 seconds the runtime
+reported:
+
+```text
+sched_error_code=100
+sub_class=S1:running-stalled
+CCU instruction address check error on both Cube and Vector
+```
+
+Source comparison found that the official entry also declares
+`KERNEL_TYPE_MIX_AIC_1_2`. Commit `37ea2ad` added that exact declaration so
+the kernel-side and PyPTO launch topology both requested one Cube and two
+Vector lanes. A second single-card probe produced the same CCU exception at
+the same instruction locations.
+
+The two runtime tasks were:
+
+```text
+task_20260730_042204_13647575525
+task_20260730_042620_151990924491
+```
+
+Their logs are preserved under:
+
+```text
+artifacts/moe-w8a8-fused-extern-probe-20260730/
+```
+
+This closes direct reuse of the upstream synchronization-heavy source through
+the current persistent `pl.jit.extern` executor. The result does not disprove
+W13 fusion itself: the official custom-op path is correct and has a 16.3 us
+component advantage. It establishes that its CrossCore Cube/Vector protocol
+cannot be transplanted into the current executor by copying tiling and launch
+metadata alone. No EP8 task was submitted for this invalid integration.
+
 ## Integration boundary
 
 PyPTO `pl.jit.extern` can compile AscendC source into the persistent executor,
@@ -171,12 +238,12 @@ integration would therefore need:
 2. a complete and reproducible `TCubeTiling` configuration;
 3. tensor and workspace ABI compatibility with the existing MoE buffers;
 4. synchronization that does not introduce a nested kernel launch;
-5. end-to-end correctness and the standard EP8 timing contract above.
+5. a synchronization implementation compatible with the persistent executor;
+6. end-to-end correctness and the standard EP8 timing contract above.
 
-The corrected standalone probe supplies component evidence, but it does not
-yet supply all of those integration guarantees. The next integration step
-should only proceed after the exact tiling and ABI can be reproduced without
-guessing.
+The corrected standalone probe supplies component evidence and the exact
+tiling/ABI. The failed source-level probe shows synchronization compatibility,
+not missing tiling data, is now the blocker.
 
 ## Current conclusions
 
@@ -186,6 +253,8 @@ guessing.
   component-level benefit after fixing the INT8 NZ storage shape.
 - A direct native PyPTO gate/up task merge exceeds the available Mat buffer and
   is not a viable implementation path in its current form.
+- Directly embedding the upstream fused source compiles, but its CrossCore
+  protocol stalls in the persistent executor and is closed for now.
 - End-to-end gains must be reported separately from component timings.
 - Smaller scheduling improvements remain worthwhile when they preserve the
   stable correctness and measurement contract.
