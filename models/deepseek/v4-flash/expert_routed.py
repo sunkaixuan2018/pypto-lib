@@ -36,8 +36,8 @@ K_TILE = 512
 INTER_K = 512
 MM_INTER_TILE = 256
 MM_GATE_INNER = 4
-ACT_INTER_TILE = 128
-ACT_GATE_INNER = 4
+ACT_INTER_TILE = 256
+ACT_GATE_INNER = 2
 D_OUT_TILE = 256
 # h_tile_i8 store innermost = QUANT_TILE bytes (int8); 512 hits the a2a3 L2 cache
 # line (perf_hint PH001 flagged the prior 256B store as sub-line).
