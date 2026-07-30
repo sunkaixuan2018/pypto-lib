@@ -42,6 +42,7 @@ D_OUT_TILE = 256
 # h_tile_i8 store innermost = QUANT_TILE bytes (int8); 512 hits the a2a3 L2 cache
 # line (perf_hint PH001 flagged the prior 256B store as sub-line).
 QUANT_TILE = 512
+QUANT_ROWS = 8
 D_OUT_TILE_ACT = 512
 W2_INNER = 4
 W2_ACT_INNER = 8
@@ -178,28 +179,40 @@ def expert_routed(
 
             h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
             h_tile_scale_dq = pl.create_tensor([RECV_TILE, 1], dtype=pl.FP32, manual_dep=True)
-            with pl.at(
-                level=pl.Level.CORE_GROUP,
+            with pl.spmd(
+                RECV_TILE // QUANT_ROWS,
                 name_hint="exp_h_q",
                 allow_early_resolve=True,
             ):
-                eh_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                q_row0 = pl.tile.get_block_idx() * QUANT_ROWS
+                eh_amax = pl.full([1, QUANT_ROWS], dtype=pl.FP32, value=INT8_AMAX_EPS)
                 for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
-                    eh_a_f32 = h_tile_fp32[:, k0 : k0 + QUANT_TILE]
+                    eh_a_f32 = h_tile_fp32[
+                        q_row0 : q_row0 + QUANT_ROWS,
+                        k0 : k0 + QUANT_TILE,
+                    ]
                     eh_a_abs = pl.maximum(eh_a_f32, pl.neg(eh_a_f32))
-                    eh_a_max = pl.reshape(pl.row_max(eh_a_abs), [1, RECV_TILE])
+                    eh_a_max = pl.reshape(pl.row_max(eh_a_abs), [1, QUANT_ROWS])
                     eh_amax = pl.maximum(eh_amax, eh_a_max)
                 eh_sq_row = pl.div(
-                    pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), eh_amax
+                    pl.full([1, QUANT_ROWS], dtype=pl.FP32, value=INT8_SCALE_MAX), eh_amax
                 )
-                h_tile_scale_dq[:, :] = pl.reshape(pl.recip(eh_sq_row), [RECV_TILE, 1])
-                eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
+                h_tile_scale_dq[
+                    q_row0 : q_row0 + QUANT_ROWS, :
+                ] = pl.reshape(pl.recip(eh_sq_row), [QUANT_ROWS, 1])
+                eh_sq_col = pl.reshape(eh_sq_row, [QUANT_ROWS, 1])
                 for k1 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
-                    eh_q_f32 = h_tile_fp32[:, k1 : k1 + QUANT_TILE]
+                    eh_q_f32 = h_tile_fp32[
+                        q_row0 : q_row0 + QUANT_ROWS,
+                        k1 : k1 + QUANT_TILE,
+                    ]
                     eh_q_scaled = pl.row_expand_mul(eh_q_f32, eh_sq_col)
                     eh_q_i32 = pl.cast(eh_q_scaled, target_type=pl.INT32, mode="rint")
                     eh_q_half = pl.cast(eh_q_i32, target_type=pl.FP16, mode="round")
-                    h_tile_i8[:, k1 : k1 + QUANT_TILE] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
+                    h_tile_i8[
+                        q_row0 : q_row0 + QUANT_ROWS,
+                        k1 : k1 + QUANT_TILE,
+                    ] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
 
             y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
             with pl.spmd(
