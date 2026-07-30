@@ -334,6 +334,37 @@ task_20260730_050708_332166013200
 artifacts/moe-ep8-w2-epilogue-fusion-20260730/
 ```
 
+## Plain transposed W8 storage
+
+Commit `6b3e7e6` extended the exact-correctness INT8 matmul probe with a
+single-variable storage comparison:
+
+- control: weight stored as `[N, K]`, consumed with `b_trans=True`;
+- candidate: weight stored as plain `[K, N]`, consumed with `b_trans=False`.
+
+This is a host-side dense transpose only. It does not claim to implement
+FRACTAL_NZ or another device-native blocked layout. One single-card task ran
+gate-shaped and W2-shaped controls and candidates in the same process. All
+four cases passed exact correctness. The medians were:
+
+```text
+gate control:       62.8 us
+gate transposed:    68.5 us  (+9.1%)
+W2 control:         38.6 us
+W2 transposed:      42.7 us  (+10.6%)
+```
+
+Plain `[K, N]` storage is therefore decisively worse for both projection
+directions. The current `b_trans=True` path is retained. No full EP8 run is
+needed because the component-level mechanism regressed in both shapes.
+
+The task and archived log are:
+
+```text
+task_20260730_051314_35826651611
+artifacts/moe-w8-transposed-storage-20260730/moe_w8_transposed_storage_20260730.log
+```
+
 ## Integration boundary
 
 PyPTO `pl.jit.extern` can compile AscendC source into the persistent executor,
@@ -367,6 +398,8 @@ not missing tiling data, is now the blocker.
   tail variance and is rejected.
 - Direct W2/epilogue fusion removes the intended GM intermediate but also
   removes useful Cube/Vector overlap, producing a clear latency regression.
+- A plain dense `[K, N]` host-side W8 transpose regresses both gate and W2
+  component timings; it is not a substitute for true blocked NZ storage.
 - End-to-end gains must be reported separately from component timings.
 - Smaller scheduling improvements remain worthwhile when they preserve the
   stable correctness and measurement contract.
