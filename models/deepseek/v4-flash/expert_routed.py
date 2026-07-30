@@ -37,7 +37,7 @@ INTER_K = 512
 MM_INTER_TILE = 256
 MM_GATE_INNER = 4
 ACT_INTER_TILE = 128
-ACT_QUANT_ROWS = 4
+ACT_QUANT_ROWS = 8
 D_OUT_TILE = 256
 # h_tile_i8 store innermost = QUANT_TILE bytes (int8); 512 hits the a2a3 L2 cache
 # line (perf_hint PH001 flagged the prior 256B store as sub-line).
@@ -147,7 +147,7 @@ def expert_routed(
 
             h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
             h_tile_scale_dq = pl.create_tensor([RECV_TILE, 1], dtype=pl.FP32, manual_dep=True)
-            # Keep four complete rows of SwiGLU output task-local until their
+            # Keep eight complete rows of SwiGLU output task-local until their
             # amax and INT8 quantization finish. This removes the FP32 GM
             # intermediate between the old activation and quant tasks.
             with pl.spmd(
