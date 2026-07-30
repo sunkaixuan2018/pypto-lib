@@ -1,0 +1,30 @@
+diff --git a/csrc/gmm/grouped_matmul_swiglu_quant_v2/op_host/op_api/aclnn_grouped_matmul_swiglu_quant_v2.cpp b/csrc/gmm/grouped_matmul_swiglu_quant_v2/op_host/op_api/aclnn_grouped_matmul_swiglu_quant_v2.cpp
+index aed77c5..f60e60e 100644
+--- a/csrc/gmm/grouped_matmul_swiglu_quant_v2/op_host/op_api/aclnn_grouped_matmul_swiglu_quant_v2.cpp
++++ b/csrc/gmm/grouped_matmul_swiglu_quant_v2/op_host/op_api/aclnn_grouped_matmul_swiglu_quant_v2.cpp
+@@ -126,7 +126,11 @@ aclnnStatus aclnnGroupedMatmulSwigluQuantWeightNzV2GetWorkspaceSize(const aclTen
+         auto n = weightScaleStorageShape[1];
+         auto xViewShape = x->GetViewShape();
+         auto k = xViewShape[1];
+-        storageShape = {expertNum, n / 64, k / 16, 16, 8};
++        if (w->GetDataType() == op::DataType::DT_INT8) {
++            storageShape = {expertNum, n / 32, k / 16, 16, 32};
++        } else {
++            storageShape = {expertNum, n / 64, k / 16, 16, 8};
++        }
+         w->SetStorageShape(storageShape);
+         CHECK_COND((storgeShape.GetDimNum() == WEIGHT_NZ_DIM_LIMIT), ACLNN_ERR_PARAM_INVALID,
+                    "aclnnGroupedMatmulSwigluQuantWeightNzV2, The dimnum of storageShape for second input (weight)"
+@@ -155,7 +159,11 @@ aclnnStatus aclnnGroupedMatmulSwigluQuantWeightNzV2GetWorkspaceSize(const aclTen
+             auto n = weightScaleStorageShape[0];
+             auto xViewShape = x->GetViewShape();
+             auto k = xViewShape[1];
+-            storageShape = {n / 64, k / 16, 16, 8};
++            if (w->GetDataType() == op::DataType::DT_INT8) {
++                storageShape = {n / 32, k / 16, 16, 32};
++            } else {
++                storageShape = {n / 64, k / 16, 16, 8};
++            }
+             w->SetStorageShape(storageShape);
+             CHECK_COND((storgeShape.GetDimNum() == MULTI_WEIGHT_NZ_DIM_LIMIT), ACLNN_ERR_PARAM_INVALID,
+                        "aclnnGroupedMatmulSwigluQuantWeightNzV2, The dimnum of storageShape for second input (weight)"
