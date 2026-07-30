@@ -1,0 +1,76 @@
+diff --git a/csrc/gmm/grouped_matmul_swiglu_quant_v2/op_host/grouped_matmul_swiglu_quant_v2_fusion_tiling.cpp b/csrc/gmm/grouped_matmul_swiglu_quant_v2/op_host/grouped_matmul_swiglu_quant_v2_fusion_tiling.cpp
+index a49a6be..91fffe6 100644
+--- a/csrc/gmm/grouped_matmul_swiglu_quant_v2/op_host/grouped_matmul_swiglu_quant_v2_fusion_tiling.cpp
++++ b/csrc/gmm/grouped_matmul_swiglu_quant_v2/op_host/grouped_matmul_swiglu_quant_v2_fusion_tiling.cpp
+@@ -155,5 +155,71 @@ void GroupedMatmulSwigluQuantV2FusionTiling::PrintTilingData()
+     OP_LOGD(context_->GetNodeName(), "groupListType: %ld", tilingData_.get_groupListType());
+     OP_LOGD(context_->GetNodeName(), "isSingleTensor: %d", tilingData_.get_isSingleTensor());
++    OP_LOGE(context_->GetNodeName(), "W8A8_TILING_DUMP cubeBlockDim=%ld", tilingData_.get_cubeBlockDim());
++    OP_LOGE(context_->GetNodeName(), "W8A8_TILING_DUMP vectorBlockDim=%ld", tilingData_.get_vectorBlockDim());
++    OP_LOGE(context_->GetNodeName(), "W8A8_TILING_DUMP groupNum=%ld", tilingData_.get_groupNum());
++    OP_LOGE(context_->GetNodeName(), "W8A8_TILING_DUMP K=%ld", tilingData_.get_K());
++    OP_LOGE(context_->GetNodeName(), "W8A8_TILING_DUMP N=%ld", tilingData_.get_N());
++    OP_LOGE(context_->GetNodeName(), "W8A8_TILING_DUMP M=%ld", tilingData_.get_M());
++    OP_LOGE(context_->GetNodeName(), "W8A8_TILING_DUMP ubFactorDimx=%ld", tilingData_.get_ubFactorDimx());
++    OP_LOGE(context_->GetNodeName(), "W8A8_TILING_DUMP ubFactorDimy=%ld", tilingData_.get_ubFactorDimy());
++    OP_LOGE(context_->GetNodeName(), "W8A8_TILING_DUMP actRight=%ld", tilingData_.get_actRight());
++    OP_LOGE(context_->GetNodeName(), "W8A8_TILING_DUMP groupListType=%ld", tilingData_.get_groupListType());
++    OP_LOGE(context_->GetNodeName(), "W8A8_TILING_DUMP isSingleTensor=%d", tilingData_.get_isSingleTensor());
++    OP_LOGE(context_->GetNodeName(), "W8A8_TILING_DUMP swigluLimit=%f", tilingData_.get_swigluLimit());
++#define LOG_MATMUL_TILING_FIELD(field) \
++    OP_LOGE(context_->GetNodeName(), "W8A8_TILING_DUMP matmulTiling." #field "=%d", \
++            tilingData_.matmulTiling.get_##field())
++    LOG_MATMUL_TILING_FIELD(usedCoreNum);
++    LOG_MATMUL_TILING_FIELD(M);
++    LOG_MATMUL_TILING_FIELD(N);
++    LOG_MATMUL_TILING_FIELD(Ka);
++    LOG_MATMUL_TILING_FIELD(Kb);
++    LOG_MATMUL_TILING_FIELD(singleCoreM);
++    LOG_MATMUL_TILING_FIELD(singleCoreN);
++    LOG_MATMUL_TILING_FIELD(singleCoreK);
++    LOG_MATMUL_TILING_FIELD(baseM);
++    LOG_MATMUL_TILING_FIELD(baseN);
++    LOG_MATMUL_TILING_FIELD(baseK);
++    LOG_MATMUL_TILING_FIELD(depthA1);
++    LOG_MATMUL_TILING_FIELD(depthB1);
++    LOG_MATMUL_TILING_FIELD(stepM);
++    LOG_MATMUL_TILING_FIELD(stepN);
++    LOG_MATMUL_TILING_FIELD(isBias);
++    LOG_MATMUL_TILING_FIELD(transLength);
++    LOG_MATMUL_TILING_FIELD(iterateOrder);
++    LOG_MATMUL_TILING_FIELD(shareMode);
++    LOG_MATMUL_TILING_FIELD(shareL1Size);
++    LOG_MATMUL_TILING_FIELD(shareL0CSize);
++    LOG_MATMUL_TILING_FIELD(shareUbSize);
++    LOG_MATMUL_TILING_FIELD(batchM);
++    LOG_MATMUL_TILING_FIELD(batchN);
++    LOG_MATMUL_TILING_FIELD(singleBatchM);
++    LOG_MATMUL_TILING_FIELD(singleBatchN);
++    LOG_MATMUL_TILING_FIELD(stepKa);
++    LOG_MATMUL_TILING_FIELD(stepKb);
++    LOG_MATMUL_TILING_FIELD(depthAL1CacheUB);
++    LOG_MATMUL_TILING_FIELD(depthBL1CacheUB);
++    LOG_MATMUL_TILING_FIELD(dbL0A);
++    LOG_MATMUL_TILING_FIELD(dbL0B);
++    LOG_MATMUL_TILING_FIELD(dbL0C);
++    LOG_MATMUL_TILING_FIELD(ALayoutInfoB);
++    LOG_MATMUL_TILING_FIELD(ALayoutInfoS);
++    LOG_MATMUL_TILING_FIELD(ALayoutInfoN);
++    LOG_MATMUL_TILING_FIELD(ALayoutInfoG);
++    LOG_MATMUL_TILING_FIELD(ALayoutInfoD);
++    LOG_MATMUL_TILING_FIELD(BLayoutInfoB);
++    LOG_MATMUL_TILING_FIELD(BLayoutInfoS);
++    LOG_MATMUL_TILING_FIELD(BLayoutInfoN);
++    LOG_MATMUL_TILING_FIELD(BLayoutInfoG);
++    LOG_MATMUL_TILING_FIELD(BLayoutInfoD);
++    LOG_MATMUL_TILING_FIELD(CLayoutInfoB);
++    LOG_MATMUL_TILING_FIELD(CLayoutInfoS1);
++    LOG_MATMUL_TILING_FIELD(CLayoutInfoN);
++    LOG_MATMUL_TILING_FIELD(CLayoutInfoG);
++    LOG_MATMUL_TILING_FIELD(CLayoutInfoS2);
++    LOG_MATMUL_TILING_FIELD(BatchNum);
++    LOG_MATMUL_TILING_FIELD(mxTypePara);
++#undef LOG_MATMUL_TILING_FIELD
+ }
+ 
+ void GroupedMatmulSwigluQuantV2FusionTiling::FillTilingData()
