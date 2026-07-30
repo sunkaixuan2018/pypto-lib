@@ -124,6 +124,33 @@ def gate_control(
 
 
 @pl.jit
+def gate_transposed_storage(
+    activation: pl.Tensor[[M, GATE_K], pl.INT8],
+    weight_kn: pl.Tensor[[GATE_K, GATE_N], pl.INT8],
+    out: pl.Out[pl.Tensor[[M, GATE_N], pl.INT32]],
+):
+    with pl.spmd(GATE_BLOCKS, name_hint="gate_transposed_storage"):
+        block_idx = pl.tile.get_block_idx()
+        n_base = block_idx * INNER * N_TILE
+        for inner in pl.range(INNER):
+            n0 = n_base + inner * N_TILE
+            acc = pl.create_tensor([M, N_TILE], dtype=pl.INT32)
+            for k0 in pl.pipeline(0, GATE_K, K_TILE, stage=2):
+                a_k = activation[:, k0:k0 + K_TILE]
+                b_k = weight_kn[
+                    k0:k0 + K_TILE, n0:n0 + N_TILE
+                ]
+                if k0 == 0:
+                    acc = pl.matmul(
+                        a_k, b_k, out_dtype=pl.INT32
+                    )
+                else:
+                    acc = pl.matmul_acc(acc, a_k, b_k)
+            out[:, n0:n0 + N_TILE] = acc
+    return out
+
+
+@pl.jit
 def gate_pingpong(
     activation: pl.Tensor[[M, GATE_K], pl.INT8],
     weight_nk: pl.Tensor[[GATE_N, GATE_K], pl.INT8],
@@ -162,6 +189,33 @@ def w2_control(
 
 
 @pl.jit
+def w2_transposed_storage(
+    activation: pl.Tensor[[M, W2_K], pl.INT8],
+    weight_kn: pl.Tensor[[W2_K, W2_N], pl.INT8],
+    out: pl.Out[pl.Tensor[[M, W2_N], pl.INT32]],
+):
+    with pl.spmd(W2_BLOCKS, name_hint="w2_transposed_storage"):
+        block_idx = pl.tile.get_block_idx()
+        n_base = block_idx * INNER * N_TILE
+        for inner in pl.range(INNER):
+            n0 = n_base + inner * N_TILE
+            acc = pl.create_tensor([M, N_TILE], dtype=pl.INT32)
+            for k0 in pl.pipeline(0, W2_K, K_TILE, stage=2):
+                a_k = activation[:, k0:k0 + K_TILE]
+                b_k = weight_kn[
+                    k0:k0 + K_TILE, n0:n0 + N_TILE
+                ]
+                if k0 == 0:
+                    acc = pl.matmul(
+                        a_k, b_k, out_dtype=pl.INT32
+                    )
+                else:
+                    acc = pl.matmul_acc(acc, a_k, b_k)
+            out[:, n0:n0 + N_TILE] = acc
+    return out
+
+
+@pl.jit
 def w2_pingpong(
     activation: pl.Tensor[[M, W2_K], pl.INT8],
     weight_nk: pl.Tensor[[W2_N, W2_K], pl.INT8],
@@ -172,7 +226,7 @@ def w2_pingpong(
     return out
 
 
-def build_specs(k: int, n: int):
+def build_specs(k: int, n: int, transposed_storage: bool = False):
     import torch
     from golden import TensorSpec
 
@@ -184,17 +238,31 @@ def build_specs(k: int, n: int):
     in_col = torch.arange(k, dtype=torch.int16)[None, :]
     weight = (((7 * out_col + 3 * in_col + 2) % 9) - 4).to(torch.int8)
 
-    return [
+    specs = [
         TensorSpec(
             "activation", [M, k], torch.int8,
             init_value=lambda: activation,
         ),
-        TensorSpec(
-            "weight_nk", [n, k], torch.int8,
-            init_value=lambda: weight,
-        ),
-        TensorSpec("out", [M, n], torch.int32, is_output=True),
     ]
+    if transposed_storage:
+        weight_kn = weight.t().contiguous()
+        specs.append(
+            TensorSpec(
+                "weight_kn", [k, n], torch.int8,
+                init_value=lambda: weight_kn,
+            )
+        )
+    else:
+        specs.append(
+            TensorSpec(
+                "weight_nk", [n, k], torch.int8,
+                init_value=lambda: weight,
+            )
+        )
+    specs.append(
+        TensorSpec("out", [M, n], torch.int32, is_output=True)
+    )
+    return specs
 
 
 def golden_projection(tensors):
@@ -203,6 +271,15 @@ def golden_projection(tensors):
     tensors["out"][:] = torch.matmul(
         tensors["activation"].to(torch.int32),
         tensors["weight_nk"].to(torch.int32).t(),
+    )
+
+
+def golden_projection_transposed_storage(tensors):
+    import torch
+
+    tensors["out"][:] = torch.matmul(
+        tensors["activation"].to(torch.int32),
+        tensors["weight_kn"].to(torch.int32),
     )
 
 
@@ -216,7 +293,9 @@ if __name__ == "__main__":
         "--shape", required=True, choices=("gate", "w2")
     )
     parser.add_argument(
-        "--backend", required=True, choices=("control", "pingpong")
+        "--backend",
+        required=True,
+        choices=("control", "transposed", "pingpong"),
     )
     parser.add_argument(
         "-p", "--platform", default="a2a3", choices=("a2a3", "a2a3sim")
@@ -228,17 +307,32 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    transposed_storage = args.backend == "transposed"
     if args.shape == "gate":
-        fn = gate_control if args.backend == "control" else gate_pingpong
+        if args.backend == "control":
+            fn = gate_control
+        elif transposed_storage:
+            fn = gate_transposed_storage
+        else:
+            fn = gate_pingpong
         k, n = GATE_K, GATE_N
     else:
-        fn = w2_control if args.backend == "control" else w2_pingpong
+        if args.backend == "control":
+            fn = w2_control
+        elif transposed_storage:
+            fn = w2_transposed_storage
+        else:
+            fn = w2_pingpong
         k, n = W2_K, W2_N
 
     result = run_jit(
         fn=fn,
-        specs=build_specs(k, n),
-        golden_fn=golden_projection,
+        specs=build_specs(k, n, transposed_storage),
+        golden_fn=(
+            golden_projection_transposed_storage
+            if transposed_storage
+            else golden_projection
+        ),
         compile_only=args.compile_only,
         compile_cfg=dict(),
         runtime_cfg=dict(
