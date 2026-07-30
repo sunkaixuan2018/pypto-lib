@@ -445,6 +445,18 @@ artifacts/moe-mixed-syncall-probe-20260730/
 artifacts/moe-w8a8-fused-extern-probe-20260730/
 ```
 
+Two independent follow-up reviews converged that no further code experiment
+in the current CANN 9.0.0 environment has a credible double-digit latency
+budget without repeating a closed path. A read-only myserver inventory found
+`cann-9.0.0` but no isolated CANN 9.0.1 installation.
+
+Further fused-W13 work is therefore gated on a supported lower-level
+capability, such as an official W8A8 fused-GMM interface in an isolated newer
+CANN environment. Its component gate is correctness at the full target shape
+and a median near 212 us or lower, preserving roughly 15 us against the
+226.9 us separated CANN component. It should not proceed to EP8 integration
+if that component gate is missed.
+
 ## Native activation and row-quant fusion attempt
 
 A narrower native candidate kept gate/up and W2 unchanged, then tried to keep
