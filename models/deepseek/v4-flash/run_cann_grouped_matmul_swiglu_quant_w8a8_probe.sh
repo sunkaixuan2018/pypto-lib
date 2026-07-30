@@ -36,7 +36,7 @@ g++ -std=c++17 -O2 \
 echo "commit=$(git rev-parse HEAD)"
 echo "device=${TASK_DEVICE:-0}"
 status=0
-for m in 768 256; do
+for m in ${PROBE_M_LIST:-768 256}; do
     echo "case=M=$m"
     if ! "$PROBE_BIN" "${TASK_DEVICE:-0}" "$m"; then
         status=1

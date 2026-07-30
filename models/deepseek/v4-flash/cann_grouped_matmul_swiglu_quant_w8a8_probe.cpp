@@ -257,6 +257,45 @@ int main(int argc, char **argv)
         std::count(outputHost.begin(), outputHost.end(), static_cast<int8_t>(0x5A)));
     const size_t zeroQuant = static_cast<size_t>(
         std::count(outputHost.begin(), outputHost.end(), static_cast<int8_t>(0)));
+    size_t fullRows = 0;
+    size_t emptyRows = 0;
+    size_t minCorrectPerRow = static_cast<size_t>(kOutputN);
+    size_t maxCorrectPerRow = 0;
+    int64_t firstPartialRow = -1;
+    for (int64_t row = 0; row < m; ++row) {
+        const auto rowBegin =
+            outputHost.begin() + static_cast<ptrdiff_t>(row * kOutputN);
+        const size_t correct = static_cast<size_t>(
+            std::count(rowBegin, rowBegin + kOutputN, static_cast<int8_t>(127)));
+        minCorrectPerRow = std::min(minCorrectPerRow, correct);
+        maxCorrectPerRow = std::max(maxCorrectPerRow, correct);
+        fullRows += correct == static_cast<size_t>(kOutputN);
+        emptyRows += correct == 0;
+        if (firstPartialRow < 0 &&
+            correct != 0 && correct != static_cast<size_t>(kOutputN)) {
+            firstPartialRow = row;
+        }
+    }
+    size_t fullColumns = 0;
+    size_t emptyColumns = 0;
+    size_t minCorrectPerColumn = static_cast<size_t>(m);
+    size_t maxCorrectPerColumn = 0;
+    int64_t firstPartialColumn = -1;
+    for (int64_t column = 0; column < kOutputN; ++column) {
+        size_t correct = 0;
+        for (int64_t row = 0; row < m; ++row) {
+            correct += outputHost[static_cast<size_t>(
+                row * kOutputN + column)] == static_cast<int8_t>(127);
+        }
+        minCorrectPerColumn = std::min(minCorrectPerColumn, correct);
+        maxCorrectPerColumn = std::max(maxCorrectPerColumn, correct);
+        fullColumns += correct == static_cast<size_t>(m);
+        emptyColumns += correct == 0;
+        if (firstPartialColumn < 0 &&
+            correct != 0 && correct != static_cast<size_t>(m)) {
+            firstPartialColumn = column;
+        }
+    }
     const float mean =
         std::accumulate(measuredUs.begin(), measuredUs.end(), 0.0F) /
         measuredUs.size();
@@ -274,6 +313,16 @@ int main(int argc, char **argv)
               << " zero_quant_count=" << zeroQuant
               << " expected_scale=" << expectedScale
               << " actual_scale0=" << outputScaleHost.front() << '\n';
+    std::cout << "row_topology full=" << fullRows
+              << " empty=" << emptyRows
+              << " min_correct=" << minCorrectPerRow
+              << " max_correct=" << maxCorrectPerRow
+              << " first_partial=" << firstPartialRow << '\n';
+    std::cout << "column_topology full=" << fullColumns
+              << " empty=" << emptyColumns
+              << " min_correct=" << minCorrectPerColumn
+              << " max_correct=" << maxCorrectPerColumn
+              << " first_partial=" << firstPartialColumn << '\n';
     std::cout << "row0_samples=";
     for (int64_t column :
          {0, 1, 254, 255, 256, 257, 510, 511, 512, 1023, 1024, 2047}) {
