@@ -132,7 +132,10 @@ def expert_routed(
                         up_acc, [RECV_TILE, MM_INTER_TILE]
                     )
 
-    for local_e in pl.parallel(N_LOCAL_EXPERTS):
+        # Keep each expert's downstream chain adjacent to its gate/up tasks in
+        # the generated graph so ready W2 work is not queued behind every
+        # sibling expert's W13 tasks.
+        local_e = local_i
         # This expert's row slab of the two accumulators.
         e_flat_base = local_e * RECV_MAX
         gate_slab = gate_i32[e_flat_base : e_flat_base + RECV_MAX]
