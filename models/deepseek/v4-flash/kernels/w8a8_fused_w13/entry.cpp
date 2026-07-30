@@ -149,6 +149,8 @@ init_tiling(GMMSwigluQuantV2TilingFusionData &tiling) {
 }  // namespace
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    KERNEL_TASK_TYPE(3, KERNEL_TYPE_MIX_AIC_1_2);
+
     // Tensor ABI: out, out_scale, workspace, x, x_scale, group_list,
     // weight_nz, weight_scale.
     GM_ADDR out = reinterpret_cast<GM_ADDR>(tensor_data<int8_t>(args, 0));
