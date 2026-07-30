@@ -294,6 +294,39 @@ artifacts/moe-ep8-expert-wave8-20260730/
 artifacts/moe-ep8-expert-wave4-20260730/
 ```
 
+### Routed W2 block fan-out
+
+The interleaved trace contains 64 routed W2 AICore blocks: four blocks for
+each of 16 experts. Commit `26cae83` tested whether reducing scheduler and
+propagation pressure could help by changing only:
+
+```text
+W2_INNER: 4 -> 8
+W2 blocks per expert: 4 -> 2
+total W2 blocks: 64 -> 32
+```
+
+The arithmetic, W8A8 storage, output tiles, task count, and dependencies were
+unchanged. Compile-only passed, and generated orchestration confirmed
+`set_block_num(2)` for `exp_w2_mm`.
+
+Exact EP8 correctness passed, but critical-rank latency regressed clearly:
+
+```text
+539.9, 538.2, 529.6, 524.4, 529.4, 509.0, 518.6, 528.2 us
+```
+
+The median was 528.8 us, the mean was 527.2 us, and
+`host_union_mean_us=3943`. The clean, repeatable device regression shows that
+64 blocks are not redundant scheduler fan-out: reducing to 32 blocks loses
+the Cube concurrency needed to hide W2 weight movement. The candidate was
+reverted in commit `f68fef6`, and lower W2 fan-out is closed.
+
+```text
+task_20260730_055538_89912515562
+artifacts/moe-ep8-w2-fanout2-20260730/
+```
+
 ## Exact fused-W13 tiling and source-level extern probe
 
 The corrected custom operator was instrumented in an isolated source tree to
@@ -538,6 +571,8 @@ not missing tiling data, is now the blocker.
   noisy and needs later confirmation.
 - Grouping experts into waves of eight or four does not improve the fully
   interleaved median; both larger rewrites are rejected and reverted.
+- Halving routed W2 blocks from 64 to 32 regresses median latency to 528.8 us;
+  the current W2 Cube fan-out is required and is retained.
 - End-to-end gains must be reported separately from component timings.
 - Smaller scheduling improvements remain worthwhile when they preserve the
   stable correctness and measurement contract.
