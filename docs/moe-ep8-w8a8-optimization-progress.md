@@ -394,6 +394,57 @@ component advantage. It establishes that its CrossCore Cube/Vector protocol
 cannot be transplanted into the current executor by copying tiling and launch
 metadata alone. No EP8 task was submitted for this invalid integration.
 
+### Whole-gang synchronization follow-up
+
+A smaller mixed extern subsequently isolated the executor's whole-gang
+barrier capability. The probe launched 24 Cube blocks and both Vector lanes
+per block, called one `AscendC::SyncAll<false>()`, and published a distinct
+marker from every participant.
+
+The first diagnostic used adjacent scalar markers. It returned only one
+writer per 64-byte GM cache line, which initially looked like missing
+participants. Cache-line-isolated rows plus explicit `dcci(...,
+CACHELINE_OUT)` proved this was writeback aliasing rather than a barrier
+failure. The corrected run returned all 24 Cube and 48 Vector markers exactly:
+
+```text
+task_20260730_062828_184288432407
+Cube:   1000..1023
+Vector: 2000..2047
+correctness: PASS
+```
+
+The fused W13 source was then changed in two bounded steps:
+
+1. map native topology queries to PyPTO's logical block and Vector-lane
+   identity, neutralize the upstream streaming CrossCore protocol, and place
+   the proven whole-gang barrier between complete Cube and Vector phases;
+2. apply the same logical topology mapping at the internal CANN Matmul include
+   boundary.
+
+Both full-shape `M=256, K=N=4096, E=16` runs compiled, but both stalled before
+producing output with `sched_error_code=100`,
+`sub_class=S1:running-stalled`, and a CCU instruction address-check error:
+
+```text
+task_20260730_064024_221038714768
+task_20260730_064310_23012522083
+```
+
+This narrows the result: the persistent executor can gang-launch and complete
+a plain mixed-core whole-gang barrier, but the transplanted CANN Matmul/fused
+operator still depends on device execution semantics that the wrapper has not
+reproduced. Per the predeclared stop criterion, direct source transplantation
+is closed after the barrier and Matmul-topology variants. No timing value or
+EP8 result is claimed for this non-running candidate.
+
+Logs are preserved under:
+
+```text
+artifacts/moe-mixed-syncall-probe-20260730/
+artifacts/moe-w8a8-fused-extern-probe-20260730/
+```
+
 ## Native activation and row-quant fusion attempt
 
 A narrower native candidate kept gate/up and W2 unchanged, then tried to keep
