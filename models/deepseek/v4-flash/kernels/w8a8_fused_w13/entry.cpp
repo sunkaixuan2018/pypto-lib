@@ -29,8 +29,6 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
 
 #include "intrinsic.h"
 #include "kernel_operator.h"
-#include "kernel_tiling/kernel_tiling.h"
-#include "lib/matmul_intf.h"
 
 namespace AscendC {
 
@@ -82,6 +80,17 @@ PyptoFusedNoopSyncAll() {
 }
 
 }  // namespace AscendC
+
+#define GetBlockIdx PyptoFusedGetBlockIdx
+#define GetBlockNum PyptoFusedGetBlockNum
+#define GetSubBlockIdx PyptoFusedGetSubBlockIdx
+#define GetSubBlockNum PyptoFusedGetSubBlockNum
+#include "kernel_tiling/kernel_tiling.h"
+#include "lib/matmul_intf.h"
+#undef GetSubBlockNum
+#undef GetSubBlockIdx
+#undef GetBlockNum
+#undef GetBlockIdx
 
 // This is the C220 device-side layout generated from
 // GMMSwigluQuantV2TilingFusionData. The values below are pinned to the
