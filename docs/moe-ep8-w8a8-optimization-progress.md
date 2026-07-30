@@ -103,6 +103,64 @@ This closes the straightforward dynamic-branch merge. A future native fusion
 must share storage inside one purpose-built kernel or use a supported fused
 operator; wrapping two existing matmul bodies in one task is not sufficient.
 
+## Early-resolve expert pipeline
+
+The stable implementation already enabled early resolve for W2, the W2
+epilogue, and the surrounding communication tasks. Commit `3853319` extends
+it to gate, up, activation, and quantization. The change does not alter tensor
+shapes, arithmetic, routing, block counts, or W8A8 storage. It allows completed
+producer tiles to enter the downstream expert stages before all sibling tasks
+have resolved.
+
+The first version of this experiment at commit `d97a132` passed correctness
+and measured:
+
+```text
+490.7, 490.8, 497.0, 495.9, 489.8, 491.8, 487.0, 490.3 us
+```
+
+Its median was 490.75 us, 5.55 us below the historical 496.3 us baseline.
+That change was originally reverted only because it missed a former 486 us
+promotion threshold, not because of a dependency or correctness failure.
+
+The restored candidate was tested again after a long period of shared-machine
+activity. Correctness passed, but its samples included one isolated
+interruption:
+
+```text
+501.0, 504.8, 492.6, 500.2, 493.7, 502.0, 500.3, 622.0 us
+```
+
+The median was 500.6 us. The other seven samples have median 500.2 us and mean
+499.2 us. Because this did not reproduce the historical absolute latency, a
+paired stable-baseline control was run under the same current conditions:
+
+```text
+503.1, 502.9, 505.1, 505.3, 499.9, 505.6, 498.4, 501.2 us
+```
+
+The paired baseline median was 503.0 us and mean was 502.7 us. The candidate
+therefore improved the primary median metric by 2.4 us. Its
+`host_union_mean_us` was also lower, 3901 us versus 3965 us for the paired
+baseline. The isolated 622.0 us sample makes the candidate's unfiltered mean
+unrepresentative, so both the raw samples and the robust comparison are
+retained here.
+
+The two independent comparisons show a small 2.4-5.55 us median benefit. The
+annotations are retained as a low-risk scheduling improvement, but they do not
+materially close the gap to the AscendC result.
+
+The tasks and logs are:
+
+```text
+candidate task: task_20260730_024656_16188983557
+baseline task:  task_20260730_035153_192839263
+
+artifacts/moe-ep8-early-resolve-restored-20260730/
+  moe_ep8_early_resolve_restored_20260730.log
+  moe_ep8_baseline_control_20260730.log
+```
+
 ## Integration boundary
 
 PyPTO `pl.jit.extern` can compile AscendC source into the persistent executor,
