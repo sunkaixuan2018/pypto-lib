@@ -27,6 +27,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
 
 #else
 
+#include "intrinsic.h"
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
