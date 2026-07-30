@@ -33,6 +33,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
 namespace {
 
 constexpr uint32_t kCubeBlocks = 24;
+constexpr uint32_t kCachelineWords = 16;
 
 template <typename T>
 static __aicore__ __attribute__((always_inline)) __gm__ T *
@@ -63,7 +64,10 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
 #endif
 
     AscendC::SyncAll<false>();
-    out[out_index] = value;
+    __gm__ int32_t *row = out + out_index * kCachelineWords;
+    row[0] = value;
+    dcci(row, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb(DSB_DDR);
 }
 
 #endif

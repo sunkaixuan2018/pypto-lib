@@ -17,6 +17,7 @@ import pypto.language as pl
 CUBE_BLOCKS = 24
 VECTOR_LANES = CUBE_BLOCKS * 2
 OUTPUTS = CUBE_BLOCKS + VECTOR_LANES
+CACHELINE_WORDS = 16
 
 _HERE = Path(__file__).resolve().parent
 _ENTRY = _HERE / "kernels" / "mixed_syncall_probe" / "entry.cpp"
@@ -59,7 +60,9 @@ def mixed_syncall_cce(out: pl.InOut[pl.Tensor]) -> pl.Tensor: ...
 
 @pl.jit
 def mixed_syncall_probe(
-    out: pl.InOut[pl.Tensor[[OUTPUTS], pl.INT32]],
+    out: pl.InOut[
+        pl.Tensor[[OUTPUTS, CACHELINE_WORDS], pl.INT32]
+    ],
 ):
     with pl.spmd(
         CUBE_BLOCKS,
@@ -77,10 +80,10 @@ def build_specs():
     return [
         TensorSpec(
             "out",
-            [OUTPUTS],
+            [OUTPUTS, CACHELINE_WORDS],
             torch.int32,
             init_value=lambda: torch.full(
-                [OUTPUTS], -1, dtype=torch.int32
+                [OUTPUTS, CACHELINE_WORDS], -1, dtype=torch.int32
             ),
             is_output=True,
         ),
@@ -96,7 +99,7 @@ def golden(tensors):
     vector = torch.arange(
         2000, 2000 + VECTOR_LANES, dtype=torch.int32
     )
-    tensors["out"].copy_(torch.cat([cube, vector]))
+    tensors["out"][:, 0].copy_(torch.cat([cube, vector]))
 
 
 def compare_participants(actual, expected, **_):
@@ -106,12 +109,12 @@ def compare_participants(actual, expected, **_):
     actual_cpu = actual.cpu()
     print(
         "SYNCALL_OUTPUT="
-        + json.dumps(actual_cpu.tolist(), separators=(",", ":"))
+        + json.dumps(actual_cpu[:, 0].tolist(), separators=(",", ":"))
     )
     if torch.equal(actual_cpu, expected.cpu()):
         return True, ""
 
-    written = torch.nonzero(actual_cpu != -1).flatten().tolist()
+    written = torch.nonzero(actual_cpu[:, 0] != -1).flatten().tolist()
     return False, f"mixed SyncAll participant mismatch; written slots={written}"
 
 
