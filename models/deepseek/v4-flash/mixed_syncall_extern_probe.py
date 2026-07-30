@@ -21,10 +21,31 @@ _HERE = Path(__file__).resolve().parent
 _ENTRY = _HERE / "kernels" / "mixed_syncall_probe" / "entry.cpp"
 
 
+def _cann_include_dirs() -> tuple[Path, ...]:
+    cann_root = Path("/usr/local/Ascend/latest")
+    devkit = cann_root / "aarch64-linux"
+    candidates = (
+        devkit / "include",
+        devkit / "asc",
+        devkit / "asc" / "include",
+        devkit / "asc" / "include" / "adv_api",
+        devkit / "asc" / "include" / "basic_api",
+        devkit / "asc" / "include" / "c_api",
+        devkit / "asc" / "include" / "interface",
+        devkit / "asc" / "include" / "simt_api",
+        devkit / "asc" / "include" / "utils",
+        devkit / "tikcpp" / "tikcfw",
+        devkit / "tikcpp" / "tikcfw" / "interface",
+        devkit / "tikcpp" / "tikcfw" / "impl",
+    )
+    return tuple(path for path in candidates if path.is_dir())
+
+
 @pl.jit.extern(
     core_type="mixed",
     aic_source=_ENTRY,
     aiv_source=_ENTRY,
+    include_dirs=_cann_include_dirs(),
     dual_aiv_dispatch=True,
 )
 def mixed_syncall_cce(out: pl.InOut[pl.Tensor]) -> pl.Tensor: ...
