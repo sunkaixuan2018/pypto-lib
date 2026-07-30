@@ -280,6 +280,31 @@ task_20260730_044451_23694672647
 artifacts/moe-ep8-act-tile256-20260730/moe_ep8_act_tile256_20260730.log
 ```
 
+## Quantization row fan-out
+
+PMU showed that `exp_h_q` accounts for 18.5% of routed AIV work but emits only
+one block per expert. Commit `52a28a4` split each independent 16-row quant task
+into two aligned 8-row blocks. It preserved the amax, scale, cast sequence,
+W8A8 data, and output layout.
+
+The candidate compiled and passed exact EP8 correctness, but doubling the
+quant task count made the critical-rank tail unstable:
+
+```text
+666.4, 721.1, 495.1, 497.8, 760.0, 497.4, 604.7, 575.6 us
+```
+
+The median was 590.2 us and `host_union_mean_us=4133`. This is a clear
+regression rather than a small noisy movement. The original single quant task
+was restored in commit `c170046`; no confirmation run is needed.
+
+The task and archived log are:
+
+```text
+task_20260730_045123_26323554515
+artifacts/moe-ep8-quant-rows8-20260730/moe_ep8_quant_rows8_20260730.log
+```
+
 ## Integration boundary
 
 PyPTO `pl.jit.extern` can compile AscendC source into the persistent executor,
@@ -309,6 +334,8 @@ not missing tiling data, is now the blocker.
   protocol stalls in the persistent executor and is closed for now.
 - Native full-row activation/quant storage currently hits an A2/A3 tile-move
   shape restriction, while a simple 256-column activation tile is noise-level.
+- Splitting row quantization into two blocks per expert increases scheduler
+  tail variance and is rejected.
 - End-to-end gains must be reported separately from component timings.
 - Smaller scheduling improvements remain worthwhile when they preserve the
   stable correctness and measurement contract.
