@@ -232,12 +232,21 @@ set_runtime_topology(__gm__ int64_t *args) {
     AscendC::pypto_fused_sub_block_idx = 0;
     AscendC::pypto_fused_sub_block_num = 1;
 #elif defined(__DAV_C220_VEC__)
+#ifdef PYPTO_FUSED_VECTOR_ONLY
+    // An AIV-only extern launches one logical PyPTO block per physical
+    // vector core.  The upstream kernel already expects flattened vector
+    // indices [0, vectorBlockDim), so no mixed-task lane expansion is needed.
+    AscendC::pypto_fused_block_idx = logical_block;
+    AscendC::pypto_fused_sub_block_idx = 0;
+    AscendC::pypto_fused_sub_block_num = 1;
+#else
     const uint32_t logical_lane =
         static_cast<uint32_t>(get_sub_block_id(args));
     AscendC::pypto_fused_block_idx =
         logical_block * 2 + logical_lane;
     AscendC::pypto_fused_sub_block_idx = logical_lane;
     AscendC::pypto_fused_sub_block_num = 2;
+#endif
 #endif
 }
 
@@ -250,16 +259,24 @@ public:
     using Base::Base;
 
     __aicore__ inline void Process() {
+#ifdef PYPTO_FUSED_VECTOR_ONLY
+        // The workspace is produced by an earlier task.  Reusing only the
+        // upstream vector phase avoids all mixed AIC/AIV synchronization.
+        this->VectorProcess();
+#else
         this->CubeProcess();
         AscendC::SyncAll<false>();
         this->VectorProcess();
+#endif
     }
 };
 
 }  // namespace
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+#ifndef PYPTO_FUSED_VECTOR_ONLY
     KERNEL_TASK_TYPE(3, KERNEL_TYPE_MIX_AIC_1_2);
+#endif
     set_runtime_topology(args);
 
     // Tensor ABI: out, out_scale, workspace, x, x_scale, group_list,
