@@ -120,6 +120,27 @@ pypto_raw_tensor_addr(int32_t index, GM_ADDR address) {
     return reinterpret_cast<__gm__ T *>(address);
 }
 
+#ifdef PYPTO_FUSED_VECTOR_ONLY
+// Scalar GlobalTensor::GetValue reads are not coherent with host-written GM
+// inputs in the persistent executor.  The standalone component probe uses the
+// fixed balanced shape of 16 rows per expert, so provide those cumulative
+// counts without touching the host-written group-list cache line.
+template <typename T>
+class PyptoFusedGlobalTensor : public AscendC::GlobalTensor<T> {};
+
+template <>
+class PyptoFusedGlobalTensor<int64_t>
+    : public AscendC::GlobalTensor<int64_t> {
+public:
+    __aicore__ inline int64_t GetValue(uint32_t index) const {
+        return static_cast<int64_t>(index + 1) * 16;
+    }
+};
+
+#include "grouped_matmul_swiglu_quant_v2_utils.h"
+#define GlobalTensor PyptoFusedGlobalTensor
+#endif
+
 // The source operator receives a tensor-list descriptor even for its
 // single-tensor path. PyPTO extern passes a raw GM pointer. The single-tensor
 // branch only requests element zero, after which it uses direct expert
@@ -133,6 +154,9 @@ pypto_raw_tensor_addr(int32_t index, GM_ADDR address) {
 #define CrossCoreWaitFlag PyptoFusedNoopCrossCoreWaitFlag
 #define SyncAll PyptoFusedNoopSyncAll
 #include "grouped_matmul_swiglu_quant_spilit_fusion.h"
+#ifdef PYPTO_FUSED_VECTOR_ONLY
+#undef GlobalTensor
+#endif
 #undef SyncAll
 #undef CrossCoreWaitFlag
 #undef CrossCoreSetFlag
@@ -233,13 +257,14 @@ set_runtime_topology(__gm__ int64_t *args) {
     AscendC::pypto_fused_sub_block_num = 1;
 #elif defined(__DAV_C220_VEC__)
 #ifdef PYPTO_FUSED_VECTOR_ONLY
-    // An AIV-only extern launches one logical PyPTO block per physical
-    // vector core.  The upstream kernel already expects flattened vector
-    // indices [0, vectorBlockDim), so no mixed-task lane expansion is needed.
+    // A pure AIV launch numbers the 48 vector lanes directly.
     AscendC::pypto_fused_block_idx = logical_block;
-    AscendC::pypto_fused_sub_block_idx = 0;
-    AscendC::pypto_fused_sub_block_num = 1;
+    AscendC::pypto_fused_sub_block_idx =
+        static_cast<uint32_t>(get_sub_block_id(args));
+    AscendC::pypto_fused_sub_block_num = 2;
 #else
+    // A mixed extern exposes the two vector lanes through the sub-block id.
+    // The upstream vector phase expects a flattened [0, 48) logical index.
     const uint32_t logical_lane =
         static_cast<uint32_t>(get_sub_block_id(args));
     AscendC::pypto_fused_block_idx =
