@@ -90,7 +90,11 @@ def expert_routed(
             t0 = t * RECV_TILE
             flat_t0 = flat_base + t0
 
-            with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm"):
+            with pl.spmd(
+                MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE),
+                name_hint="exp_gate_mm",
+                allow_early_resolve=True,
+            ):
                 nb_idx = pl.tile.get_block_idx()
                 n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
                 for ng in pl.range(MM_GATE_INNER):
@@ -107,7 +111,11 @@ def expert_routed(
                         gate_acc, [RECV_TILE, MM_INTER_TILE]
                     )
 
-            with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm"):
+            with pl.spmd(
+                MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE),
+                name_hint="exp_up_mm",
+                allow_early_resolve=True,
+            ):
                 ub_idx = pl.tile.get_block_idx()
                 u_base = ub_idx * (MM_GATE_INNER * MM_INTER_TILE)
                 for ug in pl.range(MM_GATE_INNER):
@@ -140,7 +148,11 @@ def expert_routed(
 
             h_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
 
-            with pl.spmd(MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE), name_hint="exp_gate_up_act"):
+            with pl.spmd(
+                MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE),
+                name_hint="exp_gate_up_act",
+                allow_early_resolve=True,
+            ):
                 ab_idx = pl.tile.get_block_idx()
                 a_base = ab_idx * (ACT_GATE_INNER * ACT_INTER_TILE)
                 for ag in pl.pipeline(ACT_GATE_INNER, stage=2):
@@ -166,7 +178,11 @@ def expert_routed(
 
             h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
             h_tile_scale_dq = pl.create_tensor([RECV_TILE, 1], dtype=pl.FP32, manual_dep=True)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_q"):
+            with pl.at(
+                level=pl.Level.CORE_GROUP,
+                name_hint="exp_h_q",
+                allow_early_resolve=True,
+            ):
                 eh_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
                 for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
                     eh_a_f32 = h_tile_fp32[:, k0 : k0 + QUANT_TILE]
