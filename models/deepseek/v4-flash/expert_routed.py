@@ -31,7 +31,10 @@ SWIGLU_LIMIT = M.swiglu_limit
 N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 
 # tiling
-RECV_TILE = 16
+# Balanced EP8 routes three rows to each local expert. Eight is the smallest
+# tile that keeps the per-row FP32 scale slice on a full 32-byte block while
+# avoiding the previous 16-row accumulator and activation padding.
+RECV_TILE = 8
 K_TILE = 512
 INTER_K = 512
 MM_INTER_TILE = 256
