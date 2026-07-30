@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Check whole-core SyncAll liveness in a PyPTO mixed extern task."""
 
+import os
 from pathlib import Path
 
 import pypto.language as pl
@@ -22,7 +23,12 @@ _ENTRY = _HERE / "kernels" / "mixed_syncall_probe" / "entry.cpp"
 
 
 def _cann_include_dirs() -> tuple[Path, ...]:
-    cann_root = Path("/usr/local/Ascend/latest")
+    cann_root = Path(
+        os.environ.get(
+            "ASCEND_HOME_PATH",
+            "/usr/local/Ascend/cann-9.0.0",
+        )
+    )
     devkit = cann_root / "aarch64-linux"
     candidates = (
         devkit / "include",
