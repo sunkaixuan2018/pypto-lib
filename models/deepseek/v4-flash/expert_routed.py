@@ -213,9 +213,14 @@ def expert_routed(
                         pl.add(pl.exp(pl.neg(gate_2d)), 1.0)
                     )
                     gated = pl.mul(pl.mul(gate_2d, sigmoid), up_2d)
-                    h_rows_fp32[:, a0 : a0 + ACT_INTER_TILE] = gated
+                    gated_fixed = pl.set_validshape(
+                        gated, ACT_QUANT_ROWS, ACT_INTER_TILE
+                    )
+                    h_rows_fp32[
+                        :, a0 : a0 + ACT_INTER_TILE
+                    ] = gated_fixed
                     gated_abs = pl.maximum(
-                        gated, pl.neg(gated)
+                        gated_fixed, pl.neg(gated_fixed)
                     )
                     gated_amax = pl.reshape(
                         pl.row_max(gated_abs), [1, ACT_QUANT_ROWS]
