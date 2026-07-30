@@ -624,6 +624,52 @@ task_20260730_051314_35826651611
 artifacts/moe-w8-transposed-storage-20260730/moe_w8_transposed_storage_20260730.log
 ```
 
+## CANN 9.0.0 AIV-only fused post-op
+
+Two independent reviews agreed that a pure AIV extern was the only remaining
+fusion experiment worth isolating before trying another mixed AIC/AIV path.
+Commits `91aae06` and `9b8b791` added a standalone component probe that:
+
+- keeps the W8A8 contract;
+- consumes a completed `M=256, N=4096` INT32 W13 workspace;
+- runs only dequantization, clipped SwiGLU, row amax, and INT8 quantization;
+- uses one pure AIV extern, with no CANN Matmul, `CrossCore` handshake,
+  mixed-task declaration, or Cube/Vector barrier;
+- leaves the production routed MoE unchanged.
+
+The first task, `task_20260730_074622_410407417313`, compiled but reproduced a
+CCU address-check exception. The fixed-shape source was still reading the
+host-written group list through scalar `GlobalTensor::GetValue`, which is not
+coherent in the persistent executor. The allowed structural repair kept direct
+48-lane AIV numbering and supplied the known cumulative balanced counts
+without that scalar GM read.
+
+The repaired task `task_20260730_075950_28678429230` passed every
+`256 x 2048` INT8 output and all 256 FP32 row scales. With two warmups and
+eight measured rounds, its samples were:
+
+```text
+48.3, 53.5, 41.7, 41.3, 52.0, 52.1, 46.7, 49.2 us
+```
+
+The median was 48.7 us and the mean was 48.1 us. This proves that the official
+Vector phase can run as a pure AIV persistent task under CANN 9.0.0, but it
+misses the approximately 31.4 us advancement limit. Combining the measured
+48.7 us with the existing 195.5 us W13 projection would be about 244.2 us,
+worse than the approximately 226.9 us separated component total. Therefore:
+
+- do not integrate this AIV extern into EP8;
+- do not run the lower-priority Cube-only plus AIV-only split, because it
+  retains the INT32 GM boundary and has a worse component budget;
+- do not repeat the mixed source-transplant path.
+
+The log is preserved at:
+
+```text
+artifacts/moe-w8a8-fused-aiv-20260730/moe_w8a8_fused_aiv_probe_20260730.log
+/data/sunkaixuan/skx_log_output/moe_w8a8_fused_aiv_probe_20260730.log
+```
+
 ## Integration boundary
 
 PyPTO `pl.jit.extern` can compile AscendC source into the persistent executor,
@@ -651,6 +697,10 @@ not missing tiling data, is now the blocker.
   is not a viable implementation path in its current form.
 - Directly embedding the upstream fused source compiles, but its CrossCore
   protocol stalls in the persistent executor and is closed for now.
+- The upstream Vector phase can run correctly as a CANN 9.0.0 AIV-only extern,
+  but its 48.7 us median is slower than the approximately 31.4 us advancement
+  limit, so neither AIV-only production integration nor a two-task W13 split
+  is justified.
 - Native full-row activation/quant storage currently hits an A2/A3 tile-move
   shape restriction, while a simple 256-column activation tile is noise-level.
 - Splitting row quantization into two blocks per expert increases scheduler
