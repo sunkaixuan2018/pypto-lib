@@ -249,6 +249,51 @@ task_20260730_053452_2770822610
 artifacts/moe-ep8-interleaved-expert-pipeline-20260730/trace-rank7/
 ```
 
+### Grouped expert waves
+
+Two bounded follow-up experiments tested whether grouping experts could keep
+the W2 queueing benefit while avoiding full W2/W13 contention. The generated
+orchestration for wave size eight was explicitly verified as:
+
+```text
+8 experts W13 -> 8 experts downstream -> 8 experts W13 -> 8 experts downstream
+```
+
+Wave size eight passed exact correctness and produced a clean critical-rank
+series:
+
+```text
+506.0, 499.4, 495.2, 496.0, 499.9, 497.0, 497.7, 496.9 us
+```
+
+Its median was 497.3 us and `host_union_mean_us=4698`. This removed the two
+556 us critical-rank tails seen in the fully interleaved run, but did not
+improve its 497.2 us median.
+
+Wave size four also passed exact correctness. Its critical-rank samples were:
+
+```text
+504.0, 2433.3, 496.3, 501.3, 497.2, 497.0, 499.7, 696.2 us
+```
+
+The full median was 500.5 us. Removing only the two clearly interrupted
+rounds gives a six-sample median of about 498.5 us, still no better than full
+interleaving or wave size eight.
+
+Because neither bounded wave size improved median latency and the wave
+implementation required substantially more code than the four-line graph
+ordering change, both wave candidates were reverted. The retained source is
+again exactly the full per-expert interleaving implementation. The tasks and
+logs are:
+
+```text
+wave 8: task_20260730_054534_5754332013
+wave 4: task_20260730_054802_67978615673
+
+artifacts/moe-ep8-expert-wave8-20260730/
+artifacts/moe-ep8-expert-wave4-20260730/
+```
+
 ## Exact fused-W13 tiling and source-level extern probe
 
 The corrected custom operator was instrumented in an isolated source tree to
@@ -491,6 +536,8 @@ not missing tiling data, is now the blocker.
 - Interleaving each expert's unchanged task chain reduces W2 queueing and
   shows a small 3-5 us paired median benefit, although the control window was
   noisy and needs later confirmation.
+- Grouping experts into waves of eight or four does not improve the fully
+  interleaved median; both larger rewrites are rejected and reverted.
 - End-to-end gains must be reported separately from component timings.
 - Smaller scheduling improvements remain worthwhile when they preserve the
   stable correctness and measurement contract.
