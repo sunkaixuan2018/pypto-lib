@@ -36,6 +36,7 @@ K_TILE = 512
 INTER_K = 512
 MM_INTER_TILE = 256
 MM_GATE_INNER = 4
+MM_GATE_BLOCKS = MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE)
 ACT_INTER_TILE = 128
 ACT_GATE_INNER = 4
 D_OUT_TILE = 256
@@ -90,39 +91,58 @@ def expert_routed(
             t0 = t * RECV_TILE
             flat_t0 = flat_base + t0
 
-            with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm"):
-                nb_idx = pl.tile.get_block_idx()
-                n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
-                for ng in pl.range(MM_GATE_INNER):
-                    n0 = n_base + ng * MM_INTER_TILE
-                    gate_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
-                    for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                        x_k = recv_x_flat[flat_t0 : flat_t0 + RECV_TILE, k0 : k0 + K_TILE]
-                        w1_k = routed_w1[local_i : local_i + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                        if k0 == 0:
-                            gate_acc = pl.matmul(x_k, w1_k, b_trans=True, out_dtype=pl.INT32)
-                        else:
-                            gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
-                    gate_e[t0 : t0 + RECV_TILE, n0 : n0 + MM_INTER_TILE] = pl.reshape(
-                        gate_acc, [RECV_TILE, MM_INTER_TILE]
+            # Gate and up have identical W8A8 projection shapes and independent
+            # output slabs. Dispatch their four Cube blocks as one W13 task so
+            # the runtime pays one task setup while preserving the downstream
+            # per-expert activation/W2 pipeline.
+            with pl.spmd(2 * MM_GATE_BLOCKS, name_hint="exp_w13_mm"):
+                w13_idx = pl.tile.get_block_idx()
+                is_gate = w13_idx < MM_GATE_BLOCKS
+                proj_idx = w13_idx % MM_GATE_BLOCKS
+                proj_base = proj_idx * (MM_GATE_INNER * MM_INTER_TILE)
+                for proj_inner in pl.range(MM_GATE_INNER):
+                    proj_n0 = proj_base + proj_inner * MM_INTER_TILE
+                    proj_acc = pl.create_tensor(
+                        [1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32
                     )
-
-            with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm"):
-                ub_idx = pl.tile.get_block_idx()
-                u_base = ub_idx * (MM_GATE_INNER * MM_INTER_TILE)
-                for ug in pl.range(MM_GATE_INNER):
-                    u0 = u_base + ug * MM_INTER_TILE
-                    up_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
-                    for uk0 in pl.pipeline(0, D, K_TILE, stage=2):
-                        x_u = recv_x_flat[flat_t0 : flat_t0 + RECV_TILE, uk0 : uk0 + K_TILE]
-                        w3_k = routed_w3[local_i : local_i + 1, u0 : u0 + MM_INTER_TILE, uk0 : uk0 + K_TILE]
-                        if uk0 == 0:
-                            up_acc = pl.matmul(x_u, w3_k, b_trans=True, out_dtype=pl.INT32)
+                    for proj_k0 in pl.pipeline(0, D, K_TILE, stage=2):
+                        proj_x = recv_x_flat[
+                            flat_t0 : flat_t0 + RECV_TILE,
+                            proj_k0 : proj_k0 + K_TILE,
+                        ]
+                        if is_gate:
+                            proj_w = routed_w1[
+                                local_i : local_i + 1,
+                                proj_n0 : proj_n0 + MM_INTER_TILE,
+                                proj_k0 : proj_k0 + K_TILE,
+                            ]
                         else:
-                            up_acc = pl.matmul_acc(up_acc, x_u, w3_k, b_trans=True)
-                    up_e[t0 : t0 + RECV_TILE, u0 : u0 + MM_INTER_TILE] = pl.reshape(
-                        up_acc, [RECV_TILE, MM_INTER_TILE]
+                            proj_w = routed_w3[
+                                local_i : local_i + 1,
+                                proj_n0 : proj_n0 + MM_INTER_TILE,
+                                proj_k0 : proj_k0 + K_TILE,
+                            ]
+                        if proj_k0 == 0:
+                            proj_acc = pl.matmul(
+                                proj_x, proj_w, b_trans=True, out_dtype=pl.INT32
+                            )
+                        else:
+                            proj_acc = pl.matmul_acc(
+                                proj_acc, proj_x, proj_w, b_trans=True
+                            )
+                    proj_out = pl.reshape(
+                        proj_acc, [RECV_TILE, MM_INTER_TILE]
                     )
+                    if is_gate:
+                        gate_e[
+                            t0 : t0 + RECV_TILE,
+                            proj_n0 : proj_n0 + MM_INTER_TILE,
+                        ] = proj_out
+                    else:
+                        up_e[
+                            t0 : t0 + RECV_TILE,
+                            proj_n0 : proj_n0 + MM_INTER_TILE,
+                        ] = proj_out
 
     for local_e in pl.parallel(N_LOCAL_EXPERTS):
         # This expert's row slab of the two accumulators.
