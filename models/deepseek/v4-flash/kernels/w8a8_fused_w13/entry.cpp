@@ -151,14 +151,14 @@ init_tiling(GMMSwigluQuantV2TilingFusionData &tiling) {
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     // Tensor ABI: out, out_scale, workspace, x, x_scale, group_list,
     // weight_nz, weight_scale.
-    GM_ADDR out = tensor_data<int8_t>(args, 0);
-    GM_ADDR out_scale = tensor_data<float>(args, 1);
-    GM_ADDR workspace = tensor_data<int32_t>(args, 2);
-    GM_ADDR x = tensor_data<int8_t>(args, 3);
-    GM_ADDR x_scale = tensor_data<float>(args, 4);
-    GM_ADDR group_list = tensor_data<int64_t>(args, 5);
-    GM_ADDR weight_nz = tensor_data<int8_t>(args, 6);
-    GM_ADDR weight_scale = tensor_data<float>(args, 7);
+    GM_ADDR out = reinterpret_cast<GM_ADDR>(tensor_data<int8_t>(args, 0));
+    GM_ADDR out_scale = reinterpret_cast<GM_ADDR>(tensor_data<float>(args, 1));
+    GM_ADDR workspace = reinterpret_cast<GM_ADDR>(tensor_data<int32_t>(args, 2));
+    GM_ADDR x = reinterpret_cast<GM_ADDR>(tensor_data<int8_t>(args, 3));
+    GM_ADDR x_scale = reinterpret_cast<GM_ADDR>(tensor_data<float>(args, 4));
+    GM_ADDR group_list = reinterpret_cast<GM_ADDR>(tensor_data<int64_t>(args, 5));
+    GM_ADDR weight_nz = reinterpret_cast<GM_ADDR>(tensor_data<int8_t>(args, 6));
+    GM_ADDR weight_scale = reinterpret_cast<GM_ADDR>(tensor_data<float>(args, 7));
 
     GMMSwigluQuantV2TilingFusionData tiling{};
     init_tiling(tiling);
