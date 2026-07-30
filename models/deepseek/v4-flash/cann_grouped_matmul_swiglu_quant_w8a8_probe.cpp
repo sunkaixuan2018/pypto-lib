@@ -142,9 +142,11 @@ int main(int argc, char **argv)
         ACL_MEMCPY_HOST_TO_DEVICE));
 
     aclTensor *x = CreateTensor(xDevice, {m, kK}, ACL_INT8, ACL_FORMAT_ND);
+    // The custom A8W8 host checker consumes the physical NZ view shape.
+    const std::vector<int64_t> weightNzDims = {
+        kExperts, kN / 32, kK / 16, 16, 32};
     aclTensor *weight = CreateTensor(
-        weightDevice, {kExperts, kK, kN}, ACL_INT8, ACL_FORMAT_FRACTAL_NZ,
-        {kExperts, kN / 32, kK / 16, 16, 32});
+        weightDevice, weightNzDims, ACL_INT8, ACL_FORMAT_FRACTAL_NZ);
     aclTensor *weightScale = CreateTensor(
         weightScaleDevice, {kExperts, kN}, ACL_FLOAT, ACL_FORMAT_ND);
     aclTensor *xScale =
@@ -251,6 +253,10 @@ int main(int argc, char **argv)
             return !std::isfinite(value) ||
                    std::abs(value - expectedScale) > expectedScale * 0.002F;
         }));
+    const size_t sentinelQuant = static_cast<size_t>(
+        std::count(outputHost.begin(), outputHost.end(), static_cast<int8_t>(0x5A)));
+    const size_t zeroQuant = static_cast<size_t>(
+        std::count(outputHost.begin(), outputHost.end(), static_cast<int8_t>(0)));
     const float mean =
         std::accumulate(measuredUs.begin(), measuredUs.end(), 0.0F) /
         measuredUs.size();
@@ -264,8 +270,17 @@ int main(int argc, char **argv)
               << (badQuant == 0 && badScale == 0 ? "PASS" : "FAIL")
               << " bad_quant_count=" << badQuant
               << " bad_scale_count=" << badScale
+              << " sentinel_quant_count=" << sentinelQuant
+              << " zero_quant_count=" << zeroQuant
               << " expected_scale=" << expectedScale
               << " actual_scale0=" << outputScaleHost.front() << '\n';
+    std::cout << "row0_samples=";
+    for (int64_t column :
+         {0, 1, 254, 255, 256, 257, 510, 511, 512, 1023, 1024, 2047}) {
+        std::cout << column << ':' << static_cast<int>(
+            outputHost[static_cast<size_t>(column)]) << ',';
+    }
+    std::cout << '\n';
     std::cout << "measured_median_us=" << Median(measuredUs)
               << " measured_mean_us=" << mean << '\n';
 
