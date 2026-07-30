@@ -305,6 +305,35 @@ task_20260730_045123_26323554515
 artifacts/moe-ep8-quant-rows8-20260730/moe_ep8_quant_rows8_20260730.log
 ```
 
+## W2 matmul and epilogue fusion
+
+Commit `f145dce` fused each routed W2 output tile with its FP32 dequantization,
+route-weight multiplication, per-channel scale, and BF16 store. Static PTOAS
+inspection confirmed that the separate routed `exp_w2_act` task disappeared
+and the old full-width INT32 GM store/reload was replaced by a direct
+L0C-to-Vector conversion followed by the final BF16 store. The W2 weight-side
+`PH-MR-001` warning remained unchanged, so the experiment isolated the
+intermediate and task-boundary effect.
+
+Correctness passed, but the comparable last-arriving-rank samples regressed:
+
+```text
+519.1, 513.7, 512.2, 507.6, 512.7, 509.3, 506.2, 505.7 us
+```
+
+The median was 510.8 us, the mean was 510.8 us, and
+`host_union_mean_us=4050`. Although the GM traffic reduction was real, the
+mixed task coupled the Vector epilogue to each weight-bound W2 Cube tile and
+removed the original overlap between the separate stages. The original
+overlapped W2 epilogue was restored in commit `d2bb1bc`.
+
+The task, generated PTO, and archived log are:
+
+```text
+task_20260730_050708_332166013200
+artifacts/moe-ep8-w2-epilogue-fusion-20260730/
+```
+
 ## Integration boundary
 
 PyPTO `pl.jit.extern` can compile AscendC source into the persistent executor,
@@ -336,6 +365,8 @@ not missing tiling data, is now the blocker.
   shape restriction, while a simple 256-column activation tile is noise-level.
 - Splitting row quantization into two blocks per expert increases scheduler
   tail variance and is rejected.
+- Direct W2/epilogue fusion removes the intended GM intermediate but also
+  removes useful Cube/Vector overlap, producing a clear latency regression.
 - End-to-end gains must be reported separately from component timings.
 - Smaller scheduling improvements remain worthwhile when they preserve the
   stable correctness and measurement contract.
