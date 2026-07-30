@@ -161,6 +161,70 @@ artifacts/moe-ep8-early-resolve-restored-20260730/
   moe_ep8_baseline_control_20260730.log
 ```
 
+## Per-expert task-graph interleaving
+
+The original rank-5 level-2 swimlane was reprocessed using the device-side
+task records rather than the wider AICPU residency records. Relative to the
+first device task, its main routed-stage envelopes were:
+
+```text
+dispatch_gather:     90.46 -> 119.68 us  (kernel work 8.22 us)
+gate/up combined:   115.04 -> 373.72 us
+activation:         208.14 -> 389.86 us
+W2:                 275.30 -> 454.70 us
+combine starts:     458.54 us
+```
+
+The trace also shows that a ready expert can wait behind other Cube work
+before W2 starts. Per-expert W2-ready-to-start waits ranged from about 18 us
+on the final critical experts to 118 us on earlier experts. Expert 14 ended
+the critical W2 tail at 454.70 us after waiting 20.22 us between activation
+completion and W2 start.
+
+The generated baseline graph submitted gate/up work for all 16 experts before
+submitting any activation, quantization, or W2 work. Commit `1203b19` changes
+only graph submission order by keeping each expert's unchanged
+gate/up-to-W2 chain adjacent inside the existing parallel expert loop.
+Arithmetic, W8A8 storage, tile sizes, task counts, and dependencies are
+unchanged.
+
+Compile-only validation passed. Generated orchestration inspection confirmed
+the intended per-expert task order. Exact-even-card EP8 correctness also
+passed. The candidate's critical-rank samples were:
+
+```text
+494.0, 556.8, 493.8, 499.9, 499.2, 555.9, 495.3, 495.1 us
+```
+
+The median was 497.2 us and `host_union_mean_us=4422`. Because the result had
+two local 556 us tail samples and the expected improvement was small, a paired
+restored control was submitted. Its first run suffered multi-millisecond
+whole-rank interruptions and is retained only as machine-noise evidence. The
+second control also had two obvious whole-rank interruption rounds, but its
+critical-rank median remained 502.0 us:
+
+```text
+502.5, 499.1, 501.5, 772.6, 4054.0, 498.5, 499.6, 3430.4 us
+```
+
+Removing only the two whole-rank multi-millisecond rounds gives a six-sample
+control median of 500.55 us, still 3.3 us above the candidate's unfiltered
+497.2 us median. The full medians differ by 4.8 us. This supports a small
+3-5 us scheduling gain, but the noisy controls do not justify claiming a
+cleaner or larger improvement.
+
+The graph-order change is retained as a low-risk scheduling improvement at
+commit `b4e35fa`, subject to later confirmation in a quieter server window.
+The tasks and archived logs are:
+
+```text
+candidate:           task_20260730_052459_40562572012
+interrupted control: task_20260730_052939_8510110660
+control rerun:       task_20260730_053056_13123114754
+
+artifacts/moe-ep8-interleaved-expert-pipeline-20260730/
+```
+
 ## Exact fused-W13 tiling and source-level extern probe
 
 The corrected custom operator was instrumented in an isolated source tree to
@@ -400,6 +464,9 @@ not missing tiling data, is now the blocker.
   removes useful Cube/Vector overlap, producing a clear latency regression.
 - A plain dense `[K, N]` host-side W8 transpose regresses both gate and W2
   component timings; it is not a substitute for true blocked NZ storage.
+- Interleaving each expert's unchanged task chain reduces W2 queueing and
+  shows a small 3-5 us paired median benefit, although the control window was
+  noisy and needs later confirmation.
 - End-to-end gains must be reported separately from component timings.
 - Smaller scheduling improvements remain worthwhile when they preserve the
   stable correctness and measurement contract.
