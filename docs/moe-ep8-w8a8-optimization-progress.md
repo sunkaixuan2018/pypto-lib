@@ -327,6 +327,36 @@ task_20260730_055538_89912515562
 artifacts/moe-ep8-w2-fanout2-20260730/
 ```
 
+### Reduced routed row padding
+
+Balanced EP8 sends three valid rows to each of the 16 local experts, while
+the production routed matmuls use one padded 16-row tile. A compile-gated
+candidate tested `RECV_TILE=8`, the smallest row count that keeps the FP32
+scale slice at 32 bytes.
+
+The initial `K=512` form failed memory allocation because one declared
+`256 x 512` INT8 Right tile uses 128 KiB, exceeding the 64 KiB Right-buffer
+limit. Making the pipeline depth explicit did not change that single-buffer
+size. The exact repair used `K=256`, reducing the Right tile to 64 KiB.
+
+That version reached PTOAS, where all three routed matmuls failed the same
+architectural tile constraint:
+
+```text
+pto.alloc_tile expects result boxed tile rows to be a multiple of
+innerRows (16), but got 8
+```
+
+This proves the 16-row routed matmul padding is required by the current A3
+PTOAS matrix-tile contract rather than being removable scheduling padding.
+No NPU benchmark was submitted. The candidate commits were `d2b8ae3`,
+`a76990b`, and `ed7c798`; commit `08b06a0` restored the production 16-row
+implementation.
+
+```text
+artifacts/moe-ep8-recv-tile8-20260730/codegen_errors.txt
+```
+
 ## Exact fused-W13 tiling and source-level extern probe
 
 The corrected custom operator was instrumented in an isolated source tree to
