@@ -99,6 +99,22 @@ def golden(tensors):
     tensors["out"].copy_(torch.cat([cube, vector]))
 
 
+def compare_participants(actual, expected, **_):
+    import json
+    import torch
+
+    actual_cpu = actual.cpu()
+    print(
+        "SYNCALL_OUTPUT="
+        + json.dumps(actual_cpu.tolist(), separators=(",", ":"))
+    )
+    if torch.equal(actual_cpu, expected.cpu()):
+        return True, ""
+
+    written = torch.nonzero(actual_cpu != -1).flatten().tolist()
+    return False, f"mixed SyncAll participant mismatch; written slots={written}"
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -120,6 +136,7 @@ if __name__ == "__main__":
             platform=args.platform,
             device_id=args.device,
         ),
+        compare_fn={"out": compare_participants},
         rtol=0.0,
         atol=0.0,
     )
