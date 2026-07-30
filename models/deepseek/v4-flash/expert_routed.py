@@ -105,7 +105,7 @@ def expert_routed(
                     proj_acc = pl.create_tensor(
                         [1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32
                     )
-                    for proj_k0 in pl.pipeline(0, D, K_TILE, stage=2):
+                    for proj_k0 in pl.pipeline(0, D, K_TILE, stage=1):
                         proj_x = recv_x_flat[
                             flat_t0 : flat_t0 + RECV_TILE,
                             proj_k0 : proj_k0 + K_TILE,
