@@ -228,6 +228,58 @@ component advantage. It establishes that its CrossCore Cube/Vector protocol
 cannot be transplanted into the current executor by copying tiling and launch
 metadata alone. No EP8 task was submitted for this invalid integration.
 
+## Native activation and row-quant fusion attempt
+
+A narrower native candidate kept gate/up and W2 unchanged, then tried to keep
+complete SwiGLU rows task-local through row amax and INT8 quantization. This
+would remove the FP32 `h_tile_fp32` GM round trip without importing the
+upstream CrossCore protocol.
+
+The candidate was stopped at compile time. Four-row tiles first exposed the
+required 32-byte local-row alignment. Eight-row tiles satisfied that rule and
+kept the local FP32 buffer to 64 KiB, but PTOAS rejected the move from the
+computed `8 x 128` tile into the corresponding subview:
+
+```text
+pto.tmov expects A2/A3 non-mat tmov to use matching src/dst shapes
+```
+
+Pinning the computed tile's valid shape to the same constant `8 x 128` did not
+change the generated mismatch. The production implementation was restored in
+commit `c28e700`. No NPU task was submitted. This records a current DSL/codegen
+boundary rather than evidence against activation/quant fusion as an algorithm.
+
+## Activation Vector tile width
+
+Because `exp_gate_up_act` accounts for 64% of routed AIV work, commit
+`c64128e` tested a smaller tiling-only candidate:
+
+```text
+ACT_INTER_TILE: 128 -> 256
+ACT_GATE_INNER: 4 -> 2
+```
+
+The number of activation blocks, arithmetic, tensor boundaries, and W8A8 data
+were unchanged. The candidate passed compile-only validation and exact EP8
+correctness. Its last-arriving-rank samples were:
+
+```text
+502.0, 497.4, 497.1, 497.9, 499.9, 499.2, 501.1, 496.8 us
+```
+
+The median was 498.55 us, the mean was 498.93 us, and
+`host_union_mean_us=3969`. This is only about 2 us below the recent
+early-resolve run and remains within observed run-to-run noise. It did not
+justify another eight-card paired control, so the baseline 128-column tile was
+restored in commit `e6e05d6`.
+
+The task and archived log are:
+
+```text
+task_20260730_044451_23694672647
+artifacts/moe-ep8-act-tile256-20260730/moe_ep8_act_tile256_20260730.log
+```
+
 ## Integration boundary
 
 PyPTO `pl.jit.extern` can compile AscendC source into the persistent executor,
@@ -255,6 +307,8 @@ not missing tiling data, is now the blocker.
   is not a viable implementation path in its current form.
 - Directly embedding the upstream fused source compiles, but its CrossCore
   protocol stalls in the persistent executor and is closed for now.
+- Native full-row activation/quant storage currently hits an A2/A3 tile-move
+  shape restriction, while a simple 256-column activation tile is noise-level.
 - End-to-end gains must be reported separately from component timings.
 - Smaller scheduling improvements remain worthwhile when they preserve the
   stable correctness and measurement contract.
