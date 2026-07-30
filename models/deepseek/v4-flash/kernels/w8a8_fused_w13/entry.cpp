@@ -31,6 +31,57 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 
+namespace AscendC {
+
+[[block_local]] static uint32_t pypto_fused_block_idx;
+[[block_local]] static uint32_t pypto_fused_block_num;
+[[block_local]] static uint32_t pypto_fused_sub_block_idx;
+[[block_local]] static uint32_t pypto_fused_sub_block_num;
+
+static __aicore__ __attribute__((always_inline)) uint32_t
+PyptoFusedGetBlockIdx() {
+    return pypto_fused_block_idx;
+}
+
+static __aicore__ __attribute__((always_inline)) uint32_t
+PyptoFusedGetBlockNum() {
+    return pypto_fused_block_num;
+}
+
+static __aicore__ __attribute__((always_inline)) uint32_t
+PyptoFusedGetSubBlockIdx() {
+    return pypto_fused_sub_block_idx;
+}
+
+static __aicore__ __attribute__((always_inline)) uint32_t
+PyptoFusedGetSubBlockNum() {
+    return pypto_fused_sub_block_num;
+}
+
+template <uint8_t modeId, pipe_t pipe>
+static __aicore__ __attribute__((always_inline)) void
+PyptoFusedNoopCrossCoreSetFlag(uint16_t flagId) {
+    (void)modeId;
+    (void)pipe;
+    (void)flagId;
+}
+
+template <uint8_t modeId = 0, pipe_t pipe = PIPE_S>
+static __aicore__ __attribute__((always_inline)) void
+PyptoFusedNoopCrossCoreWaitFlag(uint16_t flagId) {
+    (void)modeId;
+    (void)pipe;
+    (void)flagId;
+}
+
+template <bool isAIVOnly = true>
+static __aicore__ __attribute__((always_inline)) void
+PyptoFusedNoopSyncAll() {
+    (void)isAIVOnly;
+}
+
+}  // namespace AscendC
+
 // This is the C220 device-side layout generated from
 // GMMSwigluQuantV2TilingFusionData. The values below are pinned to the
 // production-shaped M=256, K=N=4096, E=16 W8A8 probe.
@@ -64,7 +115,21 @@ pypto_raw_tensor_addr(int32_t index, GM_ADDR address) {
 // branch only requests element zero, after which it uses direct expert
 // offsets, so replacing the lookup is sufficient for this fixed ABI.
 #define GetTensorAddr pypto_raw_tensor_addr
+#define GetBlockIdx PyptoFusedGetBlockIdx
+#define GetBlockNum PyptoFusedGetBlockNum
+#define GetSubBlockIdx PyptoFusedGetSubBlockIdx
+#define GetSubBlockNum PyptoFusedGetSubBlockNum
+#define CrossCoreSetFlag PyptoFusedNoopCrossCoreSetFlag
+#define CrossCoreWaitFlag PyptoFusedNoopCrossCoreWaitFlag
+#define SyncAll PyptoFusedNoopSyncAll
 #include "grouped_matmul_swiglu_quant_spilit_fusion.h"
+#undef SyncAll
+#undef CrossCoreWaitFlag
+#undef CrossCoreSetFlag
+#undef GetSubBlockNum
+#undef GetSubBlockIdx
+#undef GetBlockNum
+#undef GetBlockIdx
 #undef GetTensorAddr
 
 namespace {
@@ -146,10 +211,46 @@ init_tiling(GMMSwigluQuantV2TilingFusionData &tiling) {
     mm.mxTypePara = 0;
 }
 
+static __aicore__ __attribute__((always_inline)) void
+set_runtime_topology(__gm__ int64_t *args) {
+    const uint32_t logical_block =
+        static_cast<uint32_t>(get_block_idx(args));
+    AscendC::pypto_fused_block_num =
+        static_cast<uint32_t>(get_block_num(args));
+#ifdef __DAV_C220_CUBE__
+    AscendC::pypto_fused_block_idx = logical_block;
+    AscendC::pypto_fused_sub_block_idx = 0;
+    AscendC::pypto_fused_sub_block_num = 1;
+#elif defined(__DAV_C220_VEC__)
+    const uint32_t logical_lane =
+        static_cast<uint32_t>(get_sub_block_id(args));
+    AscendC::pypto_fused_block_idx =
+        logical_block * 2 + logical_lane;
+    AscendC::pypto_fused_sub_block_idx = logical_lane;
+    AscendC::pypto_fused_sub_block_num = 2;
+#endif
+}
+
+class PyptoFusedW13
+    : public GroupedMatmulDequantSwigluQuant::
+          GroupedMatmulDequantSwigluQuantFusion {
+public:
+    using Base = GroupedMatmulDequantSwigluQuant::
+        GroupedMatmulDequantSwigluQuantFusion;
+    using Base::Base;
+
+    __aicore__ inline void Process() {
+        this->CubeProcess();
+        AscendC::SyncAll<false>();
+        this->VectorProcess();
+    }
+};
+
 }  // namespace
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     KERNEL_TASK_TYPE(3, KERNEL_TYPE_MIX_AIC_1_2);
+    set_runtime_topology(args);
 
     // Tensor ABI: out, out_scale, workspace, x, x_scale, group_list,
     // weight_nz, weight_scale.
@@ -166,9 +267,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     init_tiling(tiling);
 
     AscendC::TPipe pipe;
-    GroupedMatmulDequantSwigluQuant::
-        GroupedMatmulDequantSwigluQuantFusion op(
-            &pipe, &tiling, &tiling.matmulTiling);
+    PyptoFusedW13 op(&pipe, &tiling, &tiling.matmulTiling);
 #ifdef __DAV_C220_CUBE__
     op.mm.SetSubBlockIdx(0);
     op.mm.Init(&tiling.matmulTiling, &pipe);

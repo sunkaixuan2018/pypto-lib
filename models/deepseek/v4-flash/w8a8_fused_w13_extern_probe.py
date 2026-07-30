@@ -43,7 +43,10 @@ _FUSION_KERNEL_DIR = (
 
 def _cann_include_dirs() -> tuple[Path, ...]:
     cann_root = Path(
-        os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/latest")
+        os.environ.get(
+            "ASCEND_HOME_PATH",
+            "/usr/local/Ascend/cann-9.0.0",
+        )
     )
     devkit = cann_root / "aarch64-linux"
     candidates = (
