@@ -35,8 +35,10 @@ N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 # tile that keeps the per-row FP32 scale slice on a full 32-byte block while
 # avoiding the previous 16-row accumulator and activation padding.
 RECV_TILE = 8
-K_TILE = 512
-INTER_K = 512
+# The M=8 matmul tiler keeps the declared K fragment intact. K=256 makes one
+# 256x256 INT8 Right tile exactly fit the 64 KiB platform buffer.
+K_TILE = 256
+INTER_K = 256
 MM_PIPELINE_STAGE = 1
 MM_INTER_TILE = 256
 MM_GATE_INNER = 4
