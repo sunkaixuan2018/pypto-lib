@@ -46,7 +46,7 @@ D_OUT_TILE_ACT = 512
 W2_INNER = 4
 W2_ACT_INNER = 8
 TILES_PER_EXPERT = RECV_MAX // RECV_TILE
-EXPERT_WAVE = 8
+EXPERT_WAVE = 4
 
 assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"
 assert N_LOCAL_EXPERTS % EXPERT_WAVE == 0, "local experts must be a whole number of scheduling waves"
