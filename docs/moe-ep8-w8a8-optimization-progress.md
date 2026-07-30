@@ -225,6 +225,30 @@ control rerun:       task_20260730_053056_13123114754
 artifacts/moe-ep8-interleaved-expert-pipeline-20260730/
 ```
 
+A level-3 swimlane was then captured at the retained commit. Using actual
+kernel intervals (`receive + local_setup` through `kernel-duration`) rather
+than task dispatch residency, the earliest routed W2 kernel moved from
+267.26 us in the original trace to 232.60 us. The final three critical
+experts' quant-to-W2 waits also fell from roughly 4.2-11.8 us to 0.7-3.4 us.
+This confirms that interleaving changes the intended queueing mechanism.
+
+The same profiled invocation also exposed the tradeoff: early W2 work competed
+with unfinished W13 work. Its W13 kernel envelope extended to about 302 us
+versus about 245 us in the original trace, and the profiled total was
+555.24 us. Profiled absolute times are not substituted for the unprofiled
+benchmark, but this explains why the observed end-to-end gain is small and
+potentially noise-sensitive.
+
+The next scheduling experiment, if pursued, should use expert waves rather
+than fully interleaving every expert: submit W13 for a small group, then that
+group's downstream chain. This keeps some W2 queue reduction while limiting
+W2/W13 bandwidth contention. The confirming trace task was:
+
+```text
+task_20260730_053452_2770822610
+artifacts/moe-ep8-interleaved-expert-pipeline-20260730/trace-rank7/
+```
+
 ## Exact fused-W13 tiling and source-level extern probe
 
 The corrected custom operator was instrumented in an isolated source tree to
