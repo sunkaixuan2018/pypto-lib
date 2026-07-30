@@ -22,7 +22,6 @@
 #include <acl/acl.h>
 #include <aclnn/acl_meta.h>
 #include <aclnnop/aclnn_grouped_matmul_weight_nz.h>
-#include <aclnnop/aclnn_npu_format_cast.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -70,15 +69,6 @@ void *DeviceAlloc(size_t bytes, uint8_t value = 0)
     CHECK_ACL(aclrtMalloc(&ptr, bytes, ACL_MEM_MALLOC_HUGE_FIRST));
     CHECK_ACL(aclrtMemset(ptr, bytes, value, bytes));
     return ptr;
-}
-
-size_t ElementCount(const int64_t *dims, size_t count)
-{
-    size_t elements = 1;
-    for (size_t i = 0; i < count; ++i) {
-        elements *= static_cast<size_t>(dims[i]);
-    }
-    return elements;
 }
 
 aclTensor *CreateTensor(
@@ -147,7 +137,9 @@ int main(int argc, char **argv)
     const size_t groupListBytes = static_cast<size_t>(kExperts) * sizeof(int64_t);
 
     void *xDevice = DeviceAlloc(xBytes, 0x01);
-    void *weightNdDevice = DeviceAlloc(weightBytes, 0x01);
+    // A constant tensor has identical values before and after ND-to-NZ
+    // reordering, so initialize the physical NZ allocation directly.
+    void *weightNzDevice = DeviceAlloc(weightBytes, 0x01);
     void *outputDevice = DeviceAlloc(outputBytes, 0x5A);
     void *groupListDevice = DeviceAlloc(groupListBytes);
 
@@ -161,49 +153,18 @@ int main(int argc, char **argv)
 
     aclTensor *x =
         CreateTensor(xDevice, {shape.m, shape.k}, ACL_INT8, ACL_FORMAT_ND);
-    aclTensor *weightNd = CreateTensor(
-        weightNdDevice, {kExperts, shape.k, shape.n}, ACL_INT8, ACL_FORMAT_ND);
+    aclTensor *weightNz = CreateTensor(
+        weightNzDevice, {kExperts, shape.k, shape.n}, ACL_INT8,
+        ACL_FORMAT_FRACTAL_NZ,
+        {kExperts, shape.n / 16, shape.k / 32, 16, 32});
     aclTensor *output = CreateTensor(
         outputDevice, {shape.m, shape.n}, ACL_INT32, ACL_FORMAT_ND);
     aclTensor *groupList = CreateTensor(
         groupListDevice, {kExperts}, ACL_INT64, ACL_FORMAT_ND);
-    if (x == nullptr || weightNd == nullptr || output == nullptr || groupList == nullptr) {
+    if (x == nullptr || weightNz == nullptr || output == nullptr ||
+        groupList == nullptr) {
         std::cerr << "Failed to create input ACL tensors\n";
         return 1;
-    }
-
-    int64_t *weightNzShapeData = nullptr;
-    uint64_t weightNzShapeSize = 0;
-    int weightNzFormat = ACL_FORMAT_UNDEFINED;
-    CHECK_ACL(aclnnNpuFormatCastCalculateSizeAndFormat(
-        weightNd, ACL_FORMAT_FRACTAL_NZ, ACL_INT8, &weightNzShapeData,
-        &weightNzShapeSize, &weightNzFormat));
-    std::vector<int64_t> weightNzStorageDims(
-        weightNzShapeData, weightNzShapeData + weightNzShapeSize);
-    std::free(weightNzShapeData);
-
-    const size_t weightNzBytes =
-        ElementCount(weightNzStorageDims.data(), weightNzStorageDims.size());
-    void *weightNzDevice = DeviceAlloc(weightNzBytes);
-    aclTensor *weightNz = CreateTensor(
-        weightNzDevice, {kExperts, shape.k, shape.n}, ACL_INT8,
-        static_cast<aclFormat>(weightNzFormat), weightNzStorageDims);
-    if (weightNz == nullptr) {
-        std::cerr << "Failed to create NZ weight tensor\n";
-        return 1;
-    }
-
-    uint64_t castWorkspaceBytes = 0;
-    aclOpExecutor *castExecutor = nullptr;
-    CHECK_ACL(aclnnNpuFormatCastGetWorkspaceSize(
-        weightNd, weightNz, &castWorkspaceBytes, &castExecutor));
-    void *castWorkspace =
-        castWorkspaceBytes == 0 ? nullptr : DeviceAlloc(castWorkspaceBytes);
-    CHECK_ACL(aclnnNpuFormatCast(
-        castWorkspace, castWorkspaceBytes, castExecutor, stream));
-    CHECK_ACL(aclrtSynchronizeStream(stream));
-    if (castWorkspace != nullptr) {
-        CHECK_ACL(aclrtFree(castWorkspace));
     }
 
     const aclTensor *xItems[] = {x};
@@ -287,8 +248,8 @@ int main(int argc, char **argv)
               << " N=" << shape.n << " experts=" << kExperts
               << " rows_per_expert=" << rowsPerExpert << '\n';
     std::cout << "weight_nd_bytes=" << weightBytes
-              << " weight_nz_bytes=" << weightNzBytes
-              << " weight_nz_format=" << weightNzFormat
+              << " weight_nz_bytes=" << weightBytes
+              << " weight_nz_format=" << ACL_FORMAT_FRACTAL_NZ
               << " workspace_bytes=" << workspaceBytes << '\n';
     std::cout << "correctness=" << (badOutput == 0 ? "PASS" : "FAIL")
               << " bad_output_count=" << badOutput << " expected=" << expected
@@ -306,12 +267,10 @@ int main(int argc, char **argv)
     CHECK_ACL(aclDestroyTensor(weightNz));
     CHECK_ACL(aclDestroyTensor(groupList));
     CHECK_ACL(aclDestroyTensor(output));
-    CHECK_ACL(aclDestroyTensor(weightNd));
     CHECK_ACL(aclDestroyTensor(x));
     CHECK_ACL(aclrtFree(weightNzDevice));
     CHECK_ACL(aclrtFree(groupListDevice));
     CHECK_ACL(aclrtFree(outputDevice));
-    CHECK_ACL(aclrtFree(weightNdDevice));
     CHECK_ACL(aclrtFree(xDevice));
     CHECK_ACL(aclrtDestroyStream(stream));
     CHECK_ACL(aclrtResetDevice(device));
