@@ -144,7 +144,6 @@ def expert_routed(
         for tt in pl.parallel(e_tiles):
             tt0 = tt * RECV_TILE
             flat_tt0 = e_flat_base + tt0
-            valid_rows = pl.min(RECV_TILE, e_rows - tt0)
 
             h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
             h_tile_scale_dq = pl.create_tensor([RECV_TILE, 1], dtype=pl.FP32, manual_dep=True)
@@ -158,9 +157,6 @@ def expert_routed(
             ):
                 row_block = pl.tile.get_block_idx()
                 row0 = row_block * ACT_QUANT_ROWS
-                block_valid_rows = pl.min(
-                    ACT_QUANT_ROWS, pl.max(valid_rows - row0, 0)
-                )
                 h_rows_fp32 = pl.create_tensor(
                     [ACT_QUANT_ROWS, MOE_INTER], dtype=pl.FP32
                 )
@@ -217,15 +213,9 @@ def expert_routed(
                         pl.add(pl.exp(pl.neg(gate_2d)), 1.0)
                     )
                     gated = pl.mul(pl.mul(gate_2d, sigmoid), up_2d)
-                    gated_valid = pl.set_validshape(
-                        gated, block_valid_rows, ACT_INTER_TILE
-                    )
-                    gated_masked = pl.fillpad(
-                        gated_valid, pad_value=pl.PadValue.zero
-                    )
-                    h_rows_fp32[:, a0 : a0 + ACT_INTER_TILE] = gated_masked
+                    h_rows_fp32[:, a0 : a0 + ACT_INTER_TILE] = gated
                     gated_abs = pl.maximum(
-                        gated_masked, pl.neg(gated_masked)
+                        gated, pl.neg(gated)
                     )
                     gated_amax = pl.reshape(
                         pl.row_max(gated_abs), [1, ACT_QUANT_ROWS]
