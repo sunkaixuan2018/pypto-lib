@@ -129,7 +129,7 @@ def dispatch(
     # 1-based MoE call id; `arrived`/`data_arrived` are monotonic so waits use `>= moe_epoch`.
     moe_epoch: pl.Scalar[pl.INT32],
 ):
-    send_prefix = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32, manual_dep=True)
+    send_prefix = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
 
     # Meta and payload arrivals ride two independent windows (`arrived` /
     # `data_arrived`), so the two phases barrier separately and overlap freely.
@@ -271,7 +271,12 @@ def dispatch(
     # loc_e on EVERY destination rank, so the blocking cross-rank puts fan out
     # across N_LOCAL cores. One slot counter per destination rank; token-major
     # order matches the meta pass's per-(dst, loc_e) cumulative count.
-    with pl.spmd(N_LOCAL, name_hint="dispatch_push", allow_early_resolve=True):
+    with pl.spmd(
+        N_LOCAL,
+        name_hint="dispatch_push",
+        deps=[_prefix_tid],
+        allow_early_resolve=True,
+    ):
         loc_e = pl.tile.get_block_idx()
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
