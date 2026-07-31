@@ -115,6 +115,7 @@ def dispatch(
     recv_w_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
     recv_r_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
     recv_count_out: pl.Tensor[[N_LOCAL, 1], pl.INT32],
+    recv_ready: pl.Tensor[[1], pl.INT32],
     recv_meta_local: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
     # windows
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
@@ -343,6 +344,14 @@ def dispatch(
                     cmp=pld.WaitCmp.Ge,
                 )
 
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dispatch_ready",
+        deps=[_wait_tid],
+        allow_early_resolve=True,
+    ) as _ready_tid:
+        pl.write(recv_ready, [0], pl.cast(1, pl.INT32))
+
     # The activation window is already compact. Finalize only the small scale,
     # route-weight, and origin-route arrays needed by expert compute/combine.
     with pl.spmd(
@@ -538,10 +547,11 @@ def moe(
     recv_w_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32, manual_dep=True)
     recv_r_route_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32, manual_dep=True)
     recv_count_out = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
+    recv_ready = pl.create_tensor([1], dtype=pl.INT32)
     recv_meta_local = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32, manual_dep=True)
     dispatch(
         indices, x_norm_i8, x_norm_scale, weights,
-        recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out, recv_meta_local,
+        recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out, recv_ready, recv_meta_local,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
         num_tokens, my_rank, moe_epoch,
     )
@@ -549,7 +559,7 @@ def moe(
     with pl.scope():
         recv_y = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.BF16)
         expert_routed(
-            recv_x, recv_scale_out, recv_w_out, recv_count_out,
+            recv_x, recv_scale_out, recv_w_out, recv_count_out, recv_ready,
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
             recv_y,

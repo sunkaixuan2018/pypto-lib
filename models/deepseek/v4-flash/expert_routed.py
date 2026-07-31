@@ -56,6 +56,7 @@ def expert_routed(
     recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
+    recv_ready: pl.Tensor[[1], pl.INT32],
     routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
     routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
@@ -95,6 +96,7 @@ def expert_routed(
                 name_hint="exp_gate_mm",
                 allow_early_resolve=True,
             ):
+                _recv_ready_anchor = pl.read(recv_ready, [0])
                 nb_idx = pl.tile.get_block_idx()
                 n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
                 for ng in pl.range(MM_GATE_INNER):
@@ -116,6 +118,7 @@ def expert_routed(
                 name_hint="exp_up_mm",
                 allow_early_resolve=True,
             ):
+                _recv_ready_anchor = pl.read(recv_ready, [0])
                 ub_idx = pl.tile.get_block_idx()
                 u_base = ub_idx * (MM_GATE_INNER * MM_INTER_TILE)
                 for ug in pl.range(MM_GATE_INNER):
@@ -266,8 +269,11 @@ def expert_routed_test(
     recv_y: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16]],
 ):
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
+    recv_ready = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="expert_recv_ready"):
+        pl.write(recv_ready, [0], pl.cast(1, pl.INT32))
     expert_routed(
-        recv_x_flat, recv_scale_dq, recv_weights, recv_expert_count,
+        recv_x_flat, recv_scale_dq, recv_weights, recv_expert_count, recv_ready,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
         routed_w2, routed_w2_scale,
         recv_y,
