@@ -63,9 +63,9 @@ N_EXPERTS_GLOBAL = M.n_routed_experts
 N_LOCAL = N_EXPERTS_GLOBAL // N_RANKS
 N_ROUTES = T * TOPK
 
-# Receive windows reserve RECV_MAX compact rows per local expert. One source
-# contributes at most T rows to an expert; a metadata prefix places source
-# contributions next to each other without a post-receive activation gather.
+# recv_x/recv_aux laid out [expert, source, slot], flattened to
+# [N_LOCAL * RECV_MAX, D]. Lane (e, src, slot) flat row = e * RECV_MAX +
+# src * MAX_PER_SRC + slot. One source sends <= T rows to a local expert.
 MAX_PER_SRC = T
 AUX_PAD = 8  # FP32 pack tile width (32 B min tile); cols: 0=scale 1=weight
 AUX_SCALE = 0
@@ -110,12 +110,12 @@ def dispatch(
     x_norm_i8: pl.Tensor[[T, D], pl.INT8],
     x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
-    # compact per-expert metadata consumed by expert_routed / combine
+    # compact per-expert outputs consumed by expert_routed / combine
+    recv_x_out: pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.INT8],
     recv_scale_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
     recv_w_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
     recv_r_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
     recv_count_out: pl.Tensor[[N_LOCAL, 1], pl.INT32],
-    recv_ready: pl.Tensor[[1], pl.INT32],
     recv_meta_local: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
     # windows
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
@@ -129,7 +129,8 @@ def dispatch(
     # 1-based MoE call id; `arrived`/`data_arrived` are monotonic so waits use `>= moe_epoch`.
     moe_epoch: pl.Scalar[pl.INT32],
 ):
-    send_prefix = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
+    # Flat 2-D view kept outside the scope so it stays a tensor view, not a tile.
+    recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL * RECV_MAX, D])
 
     # Meta and payload arrivals ride two independent windows (`arrived` /
     # `data_arrived`), so the two phases barrier separately and overlap freely.
@@ -210,19 +211,6 @@ def dispatch(
                     cmp=pld.WaitCmp.Ge,
                 )
 
-        # Every rank has now received its local count table. Reuse data_arrived
-        # for a meta-ready barrier before any source remotely reads a destination
-        # table to compute its direct compact offset.
-        for peer in pl.range(N_RANKS):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=data_arrived,
-                    peer=peer,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-
         # Cumsum recv_meta over sources -> per-expert receive count. The host reads
         # recv_count_out to size the routed-expert tile loop, so producing it here
         # lets routed matmuls submit while the payload is still moving.
@@ -234,49 +222,12 @@ def dispatch(
                 acc = acc + count
             pl.write(recv_count_out, [e, 0], acc)
 
-        meta_ready_expected = pl.cast((moe_epoch - 1) * (N_LOCAL + 1) + 1, pl.INT32)
-        for src in pl.range(N_RANKS):
-            if src != my_rank:
-                pld.system.wait(
-                    signal=data_arrived,
-                    offsets=[src, 0],
-                    expected=meta_ready_expected,
-                    cmp=pld.WaitCmp.Ge,
-                )
-
-    # Each block reads one destination's complete count table and computes where
-    # this source rank's rows begin for every local expert.
-    with pl.spmd(
-        N_RANKS,
-        name_hint="dispatch_prefix",
-        deps=[_meta_tid],
-        allow_early_resolve=True,
-    ) as _prefix_tid:
-        dst = pl.tile.get_block_idx()
-        dst_meta = pld.tile.remote_load(
-            recv_meta,
-            peer=dst,
-            offsets=[0, 0],
-            shape=[N_RANKS, N_LOCAL],
-        )
-        for e in pl.range(N_LOCAL):
-            prefix = pl.const(0, pl.INT32)
-            for src in pl.range(N_RANKS):
-                if src < my_rank:
-                    prefix = prefix + pl.tile.read(dst_meta, [src, e])
-            pl.write(send_prefix, [dst, e], prefix)
-
-    # Move the bulk payload (x / aux / route) directly into compact expert rows.
+    # Move the bulk payload (x / aux / route) to each destination lane.
     # Split over LOCAL EXPERT INDEX (N_LOCAL blocks): block loc_e handles expert
     # loc_e on EVERY destination rank, so the blocking cross-rank puts fan out
     # across N_LOCAL cores. One slot counter per destination rank; token-major
     # order matches the meta pass's per-(dst, loc_e) cumulative count.
-    with pl.spmd(
-        N_LOCAL,
-        name_hint="dispatch_push",
-        deps=[_prefix_tid],
-        allow_early_resolve=True,
-    ) as _push_tid:
+    with pl.spmd(N_LOCAL, name_hint="dispatch_push", allow_early_resolve=True):
         loc_e = pl.tile.get_block_idx()
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
@@ -287,7 +238,7 @@ def dispatch(
         slot_ctr = pl.array.create(N_RANKS, pl.INT32)
         for d in pl.range(N_RANKS):
             slot_ctr[d] = 0
-        e_base = loc_e * RECV_MAX
+        e_lane_base = loc_e * RECV_MAX + my_rank * MAX_PER_SRC
 
         # Pad tiles zeroed once; used cols overwritten per push, then remote_store.
         aux_tile = pl.tile.full([1, AUX_PAD], dtype=pl.FP32, value=0.0)
@@ -300,8 +251,8 @@ def dispatch(
                 if le == loc_e:
                     slot = slot_ctr[dst]
                     slot_ctr[dst] = slot + 1
-                    # Compact row = prior-source prefix + this source's slot.
-                    row = e_base + pl.read(send_prefix, [dst, loc_e]) + slot
+                    # lane (loc_e, my_rank, slot) on peer=dst
+                    row = e_lane_base + slot
                     pld.tensor.put(
                         dst=recv_x,
                         peer=dst,
@@ -317,8 +268,8 @@ def dispatch(
                     pld.tile.remote_store(route_tile, target=recv_route, peer=dst, offsets=[row, 0])
 
         # Payload-arrival notify folded into the push: each block signals every peer
-        # after its own puts. Together with the meta-ready bump, a peer sees
-        # N_LOCAL + 1 notifies per source per epoch.
+        # after its own puts, so a peer sees N_LOCAL notifies per source per epoch
+        # and the wait below expects N_LOCAL * moe_epoch. Saves the launch of a
         # separate post-push notify task. Each block bumps the count only after its
         # own puts issue in program order, which is what gates the gather -- recv_aux
         # / recv_route ride a non-draining remote_store and a PIPE_ALL barrier is not
@@ -345,34 +296,32 @@ def dispatch(
                 pld.system.wait(
                     signal=data_arrived,
                     offsets=[src, 0],
-                    expected=pl.cast(moe_epoch * (N_LOCAL + 1), pl.INT32),
+                    expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
                     cmp=pld.WaitCmp.Ge,
                 )
 
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="dispatch_ready",
-        deps=[_wait_tid],
-        allow_early_resolve=True,
-    ) as _ready_tid:
-        pl.write(recv_ready, [0], pl.cast(1, pl.INT32))
-
-    # The activation window is already compact. Finalize only the small scale,
-    # route-weight, and origin-route arrays needed by expert compute/combine.
+    # Gather lanes into the compact per-expert buffers: one SPMD block per local
+    # expert. deps on _wait_tid for the incoming payload; this rank's own
+    # dst == my_rank puts are already ordered by the local RAW edges on
+    # recv_x / recv_aux / recv_route. deps on _meta_tid for recv_meta_local, which is
+    # manual_dep and so has no auto edge from the cumsum.
     with pl.spmd(
         N_LOCAL,
-        name_hint="dispatch_finalize",
+        name_hint="dispatch_gather",
         deps=[_wait_tid, _meta_tid],
         allow_early_resolve=True,
-    ) as _finalize_tid:
+    ) as _gather_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
         b = pl.cast(0, pl.INDEX)
         for src in pl.range(N_RANKS):
             n = pl.cast(pl.read(recv_meta_local, [src, e]), pl.INDEX)
+            src_base_row = e_base_row + src * MAX_PER_SRC
             for slot in pl.range(n):
-                in_row = e_base_row + b + slot
+                in_row = src_base_row + slot
                 out_col = b + slot
+                out_row = e_base_row + out_col
+                recv_x_out_flat[out_row : out_row + 1, :] = recv_x[in_row : in_row + 1, :]
                 pl.write(recv_scale_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_SCALE]))
                 pl.write(recv_w_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_W]))
                 pl.write(recv_r_route_out, [e, out_col], pl.read(recv_route, [in_row, 0]))
@@ -548,15 +497,15 @@ def moe(
         sh,
     )
 
+    recv_x_out = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
     recv_scale_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32, manual_dep=True)
     recv_w_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32, manual_dep=True)
     recv_r_route_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32, manual_dep=True)
     recv_count_out = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
-    recv_ready = pl.create_tensor([1], dtype=pl.INT32)
     recv_meta_local = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32, manual_dep=True)
     dispatch(
         indices, x_norm_i8, x_norm_scale, weights,
-        recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out, recv_ready, recv_meta_local,
+        recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out, recv_meta_local,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
         num_tokens, my_rank, moe_epoch,
     )
@@ -564,7 +513,7 @@ def moe(
     with pl.scope():
         recv_y = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.BF16)
         expert_routed(
-            recv_x, recv_scale_out, recv_w_out, recv_count_out, recv_ready,
+            recv_x_out, recv_scale_out, recv_w_out, recv_count_out,
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
             recv_y,
