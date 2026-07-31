@@ -276,7 +276,7 @@ def dispatch(
         name_hint="dispatch_push",
         deps=[_prefix_tid],
         allow_early_resolve=True,
-    ):
+    ) as _push_tid:
         loc_e = pl.tile.get_block_idx()
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
