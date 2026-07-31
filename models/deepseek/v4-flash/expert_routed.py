@@ -52,7 +52,7 @@ assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE 
 
 @pl.jit.inline
 def expert_routed(
-    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
+    recv_x: pl.Tensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
@@ -65,7 +65,7 @@ def expert_routed(
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
 ):
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
+    recv_x_flat = recv_x
 
     # gate (w1) / up (w3) INT32 accumulators for every (expert, row-tile), flat
     # row-addressed so they survive the parallel nest that produces them.
@@ -265,8 +265,9 @@ def expert_routed_test(
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     recv_y: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16]],
 ):
+    recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
     expert_routed(
-        recv_x, recv_scale_dq, recv_weights, recv_expert_count,
+        recv_x_flat, recv_scale_dq, recv_weights, recv_expert_count,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
         routed_w2, routed_w2_scale,
         recv_y,
