@@ -11,7 +11,7 @@
 
 import pypto.language as pl
 
-from config import (FLASH as M, MOE_TOKENS, FP32_NEG_INF,
+from config import (FLASH as M, MOE_TOKENS, EP_WORLD_SIZE, FP32_NEG_INF,
                     INT8_SCALE_MAX, INT8_AMAX_EPS)
 
 
@@ -23,6 +23,8 @@ NORM_EPS = M.rms_norm_eps
 # can fan tokens across ranks. moe.py shrinks config.FLASH.n_routed_experts to
 # 32*EP before importing this module, so N_EXPERTS follows the active EP world.
 N_EXPERTS = M.n_routed_experts
+N_RANKS = EP_WORLD_SIZE
+N_LOCAL = N_EXPERTS // N_RANKS
 TOPK = M.num_experts_per_tok
 ROUTE_SCALE = M.routed_scaling_factor
 VOCAB = M.vocab_size
@@ -31,9 +33,11 @@ N_HASH_LAYERS = M.num_hash_layers
 # tiling
 T_TILE = 8
 GATE_T_TILE = 8
+assert T <= GATE_T_TILE, "decode route-count handoff requires one route task"
 GATE_M_TILE = 16        # cube M-tile: matmul rows must be a multiple of 16 (fractal)
 GATE_N_TILE = 16        # expert columns per gate spmd block
 assert N_EXPERTS % GATE_N_TILE == 0
+assert N_EXPERTS == N_RANKS * N_LOCAL
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 D_TILE = 256
 ROW_PAD = 8
@@ -61,6 +65,7 @@ def gate(
     x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
+    route_counts: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
 ):
     # Deferred RMSNorm (qwen3-style): store xg = x*gamma (NOT *inv_rms), because
     # the per-token positive scalar inv_rms factors out of everything downstream:
@@ -155,6 +160,7 @@ def gate(
     # columns so the sort ranks pad experts last. Route write-backs are guarded to
     # active tokens, so the inactive-zero can run here rather than post-route.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
+        route_counts[:, :] = pl.full([N_RANKS, N_LOCAL], dtype=pl.INT32, value=0)
         for zt in pl.range(T):
             if zt >= active_tokens:
                 pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
@@ -205,6 +211,10 @@ def gate(
     if layer_id < N_HASH_LAYERS:
         for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True):
             t1 = th_idx * GATE_T_TILE
+            count_cursor = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
+            for count_dst in pl.range(N_RANKS):
+                for count_e in pl.range(N_LOCAL):
+                    count_cursor[count_dst * N_LOCAL + count_e] = 0
             # eids from tid2eid[input_ids]: scalar lookup (dynamic row index) into a
             # Tensor. tid2eid row load hits the 32B tile floor (TOPK*4=24B), so the
             # index build stays scalar; the score fetch is a batched gather below.
@@ -213,7 +223,13 @@ def gate(
             for hs_tt in pl.range(GATE_T_TILE):
                 hs_token = pl.cast(pl.read(input_ids, [t1 + hs_tt]), pl.INDEX)
                 for hs_k in pl.range(TOPK):
-                    pl.write(hs_idx_tile, [hs_tt, hs_k], pl.read(tid2eid, [hs_token, hs_k]))
+                    hs_eid = pl.read(tid2eid, [hs_token, hs_k])
+                    pl.write(hs_idx_tile, [hs_tt, hs_k], hs_eid)
+                    if t1 + hs_tt < active_tokens:
+                        hs_dst = hs_eid // N_LOCAL
+                        hs_loc_e = hs_eid - hs_dst * N_LOCAL
+                        count_cursor[hs_dst * N_LOCAL + hs_loc_e] = \
+                            count_cursor[hs_dst * N_LOCAL + hs_loc_e] + 1
                 for hs_pad_k in pl.range(TOPK, TOPK_PAD):
                     pl.write(hs_idx_tile, [hs_tt, hs_pad_k], pl.cast(0, pl.INT32))
             # Batched score gather (replaces per-eid scalar reads); set_validshape +
@@ -234,9 +250,27 @@ def gate(
                     for hs_wt_k in pl.range(TOPK):
                         pl.write(indices, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_idx_read, [hs_wt_tt, hs_wt_k]))
                         pl.write(weights, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_weights_pad, [hs_wt_tt, hs_wt_k]))
+            count_tile = pl.tile.full([N_RANKS, N_LOCAL], dtype=pl.INT32, value=0)
+            for count_dst in pl.range(N_RANKS):
+                for count_e in pl.range(N_LOCAL):
+                    pl.tile.write(
+                        count_tile,
+                        [count_dst, count_e],
+                        count_cursor[count_dst * N_LOCAL + count_e],
+                    )
+            pl.tile.store(
+                count_tile,
+                [0, 0],
+                route_counts,
+                shapes=[N_RANKS, N_LOCAL],
+            )
     else:
         for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=True):
             t1 = ts_idx * GATE_T_TILE
+            count_cursor = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
+            for count_dst in pl.range(N_RANKS):
+                for count_e in pl.range(N_LOCAL):
+                    count_cursor[count_dst * N_LOCAL + count_e] = 0
             # topk_idx_tile stays Tensor (created here, not a pl.full Tile) so
             # the batched pl.gather below accepts it — Tile-against-Tensor src
             # is rejected.
@@ -269,8 +303,27 @@ def gate(
             for nm_tt in pl.range(GATE_T_TILE):
                 if t1 + nm_tt < active_tokens:
                     for nm_k in pl.range(TOPK):
-                        pl.write(indices, [t1 + nm_tt, nm_k], pl.read(topk_idx_read, [nm_tt, nm_k]))
+                        nm_eid = pl.read(topk_idx_read, [nm_tt, nm_k])
+                        pl.write(indices, [t1 + nm_tt, nm_k], nm_eid)
                         pl.write(weights, [t1 + nm_tt, nm_k], pl.read(nm_weights_pad, [nm_tt, nm_k]))
+                        nm_dst = nm_eid // N_LOCAL
+                        nm_loc_e = nm_eid - nm_dst * N_LOCAL
+                        count_cursor[nm_dst * N_LOCAL + nm_loc_e] = \
+                            count_cursor[nm_dst * N_LOCAL + nm_loc_e] + 1
+            count_tile = pl.tile.full([N_RANKS, N_LOCAL], dtype=pl.INT32, value=0)
+            for count_dst in pl.range(N_RANKS):
+                for count_e in pl.range(N_LOCAL):
+                    pl.tile.write(
+                        count_tile,
+                        [count_dst, count_e],
+                        count_cursor[count_dst * N_LOCAL + count_e],
+                    )
+            pl.tile.store(
+                count_tile,
+                [0, 0],
+                route_counts,
+                shapes=[N_RANKS, N_LOCAL],
+            )
 
     # The @pl.inline parser requires inline call expressions to have a return
     # value. weights is convenient because it's already pl.Out and reads as
@@ -293,12 +346,13 @@ def gate_test(
     indices: pl.Out[pl.Tensor[[T, TOPK], pl.INT32]],
     weights: pl.Out[pl.Tensor[[T, TOPK], pl.FP32]],
 ):
+    route_counts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
     gate(
         x_mixed,
         norm_w, gate_w, gate_bias,
         layer_id, num_tokens,
         tid2eid, input_ids,
-        x_norm_i8, x_norm_scale, indices, weights,
+        x_norm_i8, x_norm_scale, indices, weights, route_counts,
     )
     return x_norm_i8, x_norm_scale, indices, weights
 

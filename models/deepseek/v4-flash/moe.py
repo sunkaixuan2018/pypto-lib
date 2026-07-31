@@ -110,6 +110,7 @@ def dispatch(
     x_norm_i8: pl.Tensor[[T, D], pl.INT8],
     x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
+    route_counts: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
     # compact per-expert outputs consumed by expert_routed / combine
     recv_x_out: pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.INT8],
     recv_scale_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
@@ -158,39 +159,21 @@ def dispatch(
     if _DISPATCH_WARMUP:
         arrived_expected = pl.cast(2 * moe_epoch, pl.INT32)
 
-    # Count routes, publish counts, barrier on meta, cumsum -> recv_count_out.
-    # Needs every source's counts but none of the bulk payload.
+    # Publish the counts produced by route_hash/route_sort, barrier on meta, then
+    # cumsum -> recv_count_out. This avoids decoding the route IDs a second time.
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="dispatch_meta",
         allow_early_resolve=True,
         deps=[warmup_tid],
     ) as _meta_tid:
-        active_tokens = pl.cast(num_tokens, pl.INDEX)
-        if active_tokens < 0:
-            active_tokens = pl.cast(0, pl.INDEX)
-        if active_tokens > T:
-            active_tokens = pl.cast(T, pl.INDEX)
-
-        # Count how many routes land in each (dst, loc_e) lane (no payload move).
-        cursor = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
-        for d in pl.range(N_RANKS):
-            for e in pl.range(N_LOCAL):
-                cursor[d * N_LOCAL + e] = 0
-        for t in pl.range(active_tokens):
-            for k in pl.range(TOPK):
-                eid = pl.read(indices, [t, k])
-                dst = eid // N_LOCAL
-                loc_e = eid - dst * N_LOCAL
-                cursor[dst * N_LOCAL + loc_e] = cursor[dst * N_LOCAL + loc_e] + 1
-
         # One meta row per dst (all N_LOCAL counts, zeros included), then bump the
         # per-source arrival counter. AtomicAdd on a monotonic window is
         # order-independent, so a late notify from an earlier epoch cannot clobber it.
         meta_tile = pl.tile.full([1, N_LOCAL], dtype=pl.INT32, value=0)
         for dst in pl.range(N_RANKS):
             for e in pl.range(N_LOCAL):
-                pl.tile.write(meta_tile, [0, e], cursor[dst * N_LOCAL + e])
+                pl.tile.write(meta_tile, [0, e], pl.read(route_counts, [dst, e]))
             pld.tile.remote_store(meta_tile, target=recv_meta, peer=dst, offsets=[my_rank, 0])
             if dst != my_rank:
                 pld.system.notify(
@@ -483,10 +466,11 @@ def moe(
     x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32, manual_dep=True)
     indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
     weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
+    route_counts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
     gate(
         x_mixed, norm_w, gate_w, gate_bias,
         layer_id, num_tokens, tid2eid, input_ids,
-        x_norm_i8, x_norm_scale, indices, weights,
+        x_norm_i8, x_norm_scale, indices, weights, route_counts,
     )
 
     sh = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -504,7 +488,7 @@ def moe(
     recv_count_out = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
     recv_meta_local = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32, manual_dep=True)
     dispatch(
-        indices, x_norm_i8, x_norm_scale, weights,
+        indices, x_norm_i8, x_norm_scale, weights, route_counts,
         recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out, recv_meta_local,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
         num_tokens, my_rank, moe_epoch,
