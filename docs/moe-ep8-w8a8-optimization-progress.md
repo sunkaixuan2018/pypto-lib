@@ -670,6 +670,58 @@ artifacts/moe-w8a8-fused-aiv-20260730/moe_w8a8_fused_aiv_probe_20260730.log
 /data/sunkaixuan/skx_log_output/moe_w8a8_fused_aiv_probe_20260730.log
 ```
 
+## Per-expert dispatch wait pipeline
+
+A two-reviewer crosscheck compared three CANN-inspired dispatch layouts:
+
+- a separate per-expert wait/gather task;
+- one per-expert push, notify, wait, and gather task;
+- a direct compact-row layout with additional count/prefix exchange.
+
+The last option was rejected from existing evidence: the correct direct-layout
+experiment measured 538.3 us versus its 494.85 us control because the all-rank
+prefix exchange cost more than the removed gather copy. The trace also bounds
+the current gather kernel work at only 8.22 us.
+
+Commit `f5d80f0` added a standalone EP8 scheduling probe with 16 local expert
+blocks and one 4096-byte payload row per source/expert. On exact even devices
+`0,2,4,6,8,10,12,14`:
+
+- the separate 16-block wait task did not finish within the 45-second timeout;
+- the single-task send-before-wait form completed and passed every
+  `[8, 16, 8, 4096]` INT8 output.
+
+This confirms that separate spinning waiters can starve their producers, while
+the same-block ordering is live under the tested scheduler.
+
+A guarded MoE candidate then kept `dispatch_meta` independent and replaced
+`dispatch_push -> dispatch_wait -> dispatch_gather` with one 16-block
+`dispatch_push_gather` task. Each block sent its own expert rows before waiting
+on expert-specific payload signals. It read remote counts only after observing
+the existing meta signal, so no task-level dependency delayed the push half.
+The generated orchestration confirmed that `dispatch_meta` and
+`dispatch_push_gather` had no dependency edge.
+
+The candidate passed exact EP8 balanced-routing correctness. With two warmups
+and eight measured rounds, the critical-rank samples were:
+
+```text
+514.5, 507.5, 514.7, 511.6, 509.8, 504.8, 509.4, 512.9 us
+```
+
+The median was 510.7 us and `host_union_mean_us=3712`, approximately 14.4 us
+slower than the retained 496.3 us baseline. The single-task form removes one
+wait task but adds per-expert payload/meta waits and couples each block's send
+and gather lifetime. The end-to-end result shows that these costs exceed any
+overlap recovered from the 8.22 us gather copy. The production candidate is
+therefore rejected; the standalone probe remains as scheduler evidence.
+
+Logs are preserved under:
+
+```text
+artifacts/moe-dispatch-expert-pipeline-20260803/
+```
+
 ## Integration boundary
 
 PyPTO `pl.jit.extern` can compile AscendC source into the persistent executor,
@@ -716,6 +768,9 @@ not missing tiling data, is now the blocker.
   interleaved median; both larger rewrites are rejected and reverted.
 - Halving routed W2 blocks from 64 to 32 regresses median latency to 528.8 us;
   the current W2 Cube fan-out is required and is retained.
+- A separate 16-block dispatch wait task deadlocks under the tested EP8
+  scheduler. The live same-block alternative is correct but regresses median
+  latency to 510.7 us, so neither per-expert wait layout is retained.
 - End-to-end gains must be reported separately from component timings.
 - Smaller scheduling improvements remain worthwhile when they preserve the
   stable correctness and measurement contract.
