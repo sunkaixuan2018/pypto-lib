@@ -29,6 +29,7 @@ VOCAB = M.vocab_size
 N_HASH_LAYERS = M.num_hash_layers
 
 # tiling
+T_TILE = 8
 GATE_T_TILE = 8
 GATE_M_TILE = 16        # cube M-tile: matmul rows must be a multiple of 16 (fractal)
 GATE_N_TILE = 16        # expert columns per gate spmd block
@@ -40,6 +41,7 @@ FFN_REDUCE_TILE = D // ROW_PAD
 assert D % ROW_PAD == 0
 GATE_D_TILE = 2048
 assert D % GATE_D_TILE == 0, "gate K-loop must cover D"
+QUANT_TILE = 256
 SCORE_PAD = 256         # padded expert row for sort32 + mrgsort
 TOPK_PAD = 8            # TOPK padded to 32B-aligned width
 SORT_PAD = TOPK_PAD * 2 # (val, idx) interleaved slice width
@@ -69,6 +71,9 @@ def gate(
     # a sqsum pass followed by a separate normalize pass.
     xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
     inv_rms_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
+    # per-token int8 quant scale (= INT8_SCALE_MAX / amax(xg)), computed in ffn_norm
+    # and consumed by x_norm_quant so quant skips its own amax pass.
+    xn_scale_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
     route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     active_tokens = pl.cast(num_tokens, pl.INDEX)
@@ -120,27 +125,31 @@ def gate(
         xg_dequant_scale = pl.mul(xg_amax, 1.0 / INT8_SCALE_MAX)
         x_norm_dequant_scale = pl.mul(xg_dequant_scale, inv_rms)
         pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
-        xg_sq_col = pl.reshape(xg_sq, [ROW_PAD, 1])
-        xg_sq_matrix = pl.row_expand(
-            pl.tile.full([ROW_PAD, ROW_PAD], dtype=pl.FP32, value=0.0),
-            xg_sq_col,
-        )
-        xg_sq_row = xg_sq_matrix[0:1, :]
-        xn_q_scaled = pl.reshape(
-            pl.col_expand_mul(
-                pl.reshape(xg, [FFN_REDUCE_TILE, ROW_PAD]),
-                xg_sq_row,
-            ),
-            [1, D],
-        )
-        xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
-        xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
-        pl.tile.store(
-            pl.cast(xn_q_half, pl.INT8, mode="trunc"),
-            [tok, 0],
-            x_norm_i8,
-            shapes=[1, D],
-        )
+        pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
+
+    seed_dummy = pl.system.task_dummy(deps=[])
+
+    # Per-token symmetric INT8 quant of xg: scale precomputed in ffn_norm. inv_rms
+    # cancels here (symmetric quant is invariant to a positive per-token scalar),
+    # so x_norm_i8 = quant(xg). Early resolution lets the shared-expert chain
+    # pre-stage before dispatch_push.
+    for t0 in pl.parallel(0, active_gate_tokens, T_TILE):
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="x_norm_quant",
+            deps=[seed_dummy],
+            allow_early_resolve=True,
+        ):
+            xn_sq_col = xn_scale_buf[t0 : t0 + T_TILE, 0:1]
+            for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
+                xn_q_scaled = pl.row_expand_mul(
+                    xg_buf[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE],
+                    xn_sq_col,
+                )
+                xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
+                xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
+                x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = \
+                    pl.cast(xn_q_half, pl.INT8, mode="trunc")
 
     # Pre-route setup: zero the inactive-token outputs and NEG_INF the biased pad
     # columns so the sort ranks pad experts last. Route write-backs are guarded to
