@@ -92,6 +92,7 @@ A distributed program adds a per-rank breakdown and a context line:
 | `PYPTO_BENCH_ROUNDS` | `100` | Timed rounds. 100 rounds is ~0.1 s of device time for a decode step but minutes for a long prefill or a multi-card run — drop it while iterating. |
 | `PYPTO_BENCH_WARMUP` | `5` | Leading launches discarded before measurement. The resident L3 path always keeps ≥ 1 (its first warmup launch doubles as the validation dispatch). |
 | `PYPTO_BENCH_RAW` | off | Prints every measured dispatch's Effective sample, one line per rank, in dispatch order. Use it when a summary looks suspicious — start-up drift, a bimodal rank, one card lagging. |
+| `PYPTO_L2_PROFILE_AFTER_WARMUP` | off | Resident L3 only: when L2 swimlane collection is enabled, run validation and warmup launches without L2 and enable it only for measured launches. Pair with `PYPTO_BENCH_ROUNDS=1` to capture exactly one fully warmed launch. |
 
 A malformed or out-of-range value warns and falls back to the default
 rather than failing the run. Daily CI sets none of the three, so its numbers

@@ -417,6 +417,26 @@ def _resident_loop_sizes() -> tuple[int, int]:
     return rounds, max(warmup, 1)
 
 
+def _l3_warmup_run_config(run_config: Any) -> Any:
+    """Return the resident-L3 config used by validation and warmup launches.
+
+    ``PYPTO_L2_PROFILE_AFTER_WARMUP=1`` keeps the prepared worker, resident
+    tensors, and communication state live while disabling L2 collection for
+    validation and warmup. Measured launches retain the caller's original
+    config, so a one-round benchmark captures only the first fully warmed
+    launch instead of mixing startup waits into the swimlane.
+    """
+    import dataclasses
+    import os
+
+    enabled = os.environ.get("PYPTO_L2_PROFILE_AFTER_WARMUP", "").strip()
+    if enabled in ("", "0", "false", "False"):
+        return run_config
+    if not getattr(run_config, "enable_l2_swimlane", 0):
+        return run_config
+    return dataclasses.replace(run_config, enable_l2_swimlane=0)
+
+
 def _bench_raw_enabled() -> bool:
     """True when ``PYPTO_BENCH_RAW`` is set truthy.
 
@@ -987,6 +1007,7 @@ def _run_l3_resident(
     from pypto.runtime.log_config import configure_log, current_level  # noqa: PLC0415
 
     rounds, warmup = _resident_loop_sizes()
+    warmup_run_config = _l3_warmup_run_config(run_config)
 
     def _bench_dispatch(rt: Any, ordered: list[Any], resident_handles: list) -> None:
         # warmup[0] doubles as the validation dispatch: run once, validate its
@@ -994,11 +1015,11 @@ def _run_l3_resident(
         # The parser drops the leading `warmup` dispatches, so this launch is
         # excluded from the samples; the total stays warmup + rounds, which keeps
         # each rank's marker stream evenly segmentable into rounds.
-        rt(*ordered, config=run_config)
+        rt(*ordered, config=warmup_run_config)
         _validate_once(rt, resident_handles)
         try:
             for _ in range(warmup - 1):
-                rt(*ordered, config=run_config)
+                rt(*ordered, config=warmup_run_config)
             for _ in range(rounds):
                 rt(*ordered, config=run_config)
         except Exception as e:  # noqa: BLE001 — benchmark rounds are never a correctness gate

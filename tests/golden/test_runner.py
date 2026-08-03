@@ -14,6 +14,7 @@ so they run without a device.
 """
 
 import ctypes
+import dataclasses
 import sys
 import types
 from pathlib import Path
@@ -1660,6 +1661,24 @@ class TestBenchLoopSizes:
         monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "7")
         monkeypatch.setenv("PYPTO_BENCH_WARMUP", "0")
         assert _resident_loop_sizes() == (7, 1)
+
+    def test_l3_warmup_can_disable_l2_until_measured_round(self, monkeypatch):
+        """The opt-in strips L2 only from validation and warmup launches."""
+        import golden.runner as R
+
+        @dataclasses.dataclass
+        class _Config:
+            enable_l2_swimlane: int = 3
+            enable_dep_gen: bool = False
+
+        measured = _Config()
+        monkeypatch.setenv("PYPTO_L2_PROFILE_AFTER_WARMUP", "1")
+        warmup = R._l3_warmup_run_config(measured)
+
+        assert warmup is not measured
+        assert warmup.enable_l2_swimlane == 0
+        assert measured.enable_l2_swimlane == 3
+        assert warmup.enable_dep_gen is False
 
 
 class TestBenchReports:
