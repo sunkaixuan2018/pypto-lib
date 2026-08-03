@@ -480,7 +480,7 @@ def dispatch(
             name_hint="dispatch_gather",
             deps=[_wait_tid, _meta_tid],
             allow_early_resolve=True,
-        ):
+        ) as _gather_tid:
             e = pl.tile.get_block_idx()
             e_base_row = e * RECV_MAX
             b = pl.cast(0, pl.INDEX)
