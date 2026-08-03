@@ -63,4 +63,5 @@ def route_hash_aiv_cce(
 ) -> tuple[
     pl.Tensor[[TOKENS, TOPK], pl.FP32],
     pl.Tensor[[TOKENS, TOPK], pl.INT32],
-]: ...
+]:
+    return weights, indices
