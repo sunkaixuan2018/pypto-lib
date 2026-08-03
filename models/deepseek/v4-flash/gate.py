@@ -122,7 +122,7 @@ def gate(
         x_norm_dequant_scale = pl.mul(xg_dequant_scale, inv_rms)
         pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
         pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
-        xn_q_scaled = pl.row_expand_mul(xg, xn_scale_buf[tok : tok + 1, 0:1])
+        xn_q_scaled = pl.mul(xg, pl.read(xn_scale_buf, [tok, 0]))
         xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
         xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
         pl.tile.store(
