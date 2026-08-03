@@ -9,10 +9,19 @@
 """DeepSeek-V4 MoE FFN router (decode): RMSNorm + gate + topk + normalize."""
 
 
+import os
+
 import pypto.language as pl
 
 from config import (FLASH as M, MOE_TOKENS, FP32_NEG_INF,
                     INT8_SCALE_MAX, INT8_AMAX_EPS)
+from route_hash_aiv import (
+    EXPERTS as ROUTE_HASH_AIV_EXPERTS,
+    SCORE_PAD as ROUTE_HASH_AIV_SCORE_PAD,
+    TOKENS as ROUTE_HASH_AIV_TOKENS,
+    TOPK as ROUTE_HASH_AIV_TOPK,
+    route_hash_aiv_cce,
+)
 
 
 # model config
@@ -46,6 +55,15 @@ SCORE_PAD = 256         # padded expert row for sort32 + mrgsort
 TOPK_PAD = 8            # TOPK padded to 32B-aligned width
 SORT_PAD = TOPK_PAD * 2 # (val, idx) interleaved slice width
 assert TOPK <= TOPK_PAD
+
+_ROUTE_HASH_IMPL = os.environ.get("PYPTO_ROUTE_HASH_IMPL", "native")
+_USE_ROUTE_HASH_AIV = (
+    _ROUTE_HASH_IMPL == "aiv"
+    and T == ROUTE_HASH_AIV_TOKENS
+    and N_EXPERTS == ROUTE_HASH_AIV_EXPERTS
+    and TOPK == ROUTE_HASH_AIV_TOPK
+    and SCORE_PAD == ROUTE_HASH_AIV_SCORE_PAD
+)
 
 @pl.jit.inline
 def gate(
@@ -203,37 +221,52 @@ def gate(
     active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
     # Hash layers index via tid2eid[input_ids]; score layers sort+gather.
     if layer_id < N_HASH_LAYERS:
-        for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True):
-            t1 = th_idx * GATE_T_TILE
-            # eids from tid2eid[input_ids]: scalar lookup (dynamic row index) into a
-            # Tensor. tid2eid row load hits the 32B tile floor (TOPK*4=24B), so the
-            # index build stays scalar; the score fetch is a batched gather below.
-            # Tail [TOPK, TOPK_PAD) zeroed so fillpad drops it from the sum.
-            hs_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
-            for hs_tt in pl.range(GATE_T_TILE):
-                hs_token = pl.cast(pl.read(input_ids, [t1 + hs_tt]), pl.INDEX)
-                for hs_k in pl.range(TOPK):
-                    pl.write(hs_idx_tile, [hs_tt, hs_k], pl.read(tid2eid, [hs_token, hs_k]))
-                for hs_pad_k in pl.range(TOPK, TOPK_PAD):
-                    pl.write(hs_idx_tile, [hs_tt, hs_pad_k], pl.cast(0, pl.INT32))
-            # Batched score gather (replaces per-eid scalar reads); set_validshape +
-            # fillpad zero the [TOPK, TOPK_PAD) tail so row_sum sees only TOPK.
-            local_scores = pl.create_tensor([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32)
-            local_scores[:, :] = route_scores_buf[t1 : t1 + GATE_T_TILE, :]
-            gather_all = pl.gather(local_scores, dim=-1, index=hs_idx_tile)
-            gather_valid = pl.set_validshape(gather_all, GATE_T_TILE, TOPK)
-            hs_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
-            # Copy to dodge the tensor_view-vs-ptr SSA conflict between the gather
-            # and the scalar pl.read below (pypto #1493).
-            hs_idx_read = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
-            hs_idx_read[:, :] = hs_idx_tile[:, :]
-            hs_denom = pl.reshape(pl.row_sum(hs_vals_pad), [GATE_T_TILE, 1])
-            hs_weights_pad = pl.mul(pl.row_expand_div(hs_vals_pad, hs_denom), ROUTE_SCALE)
-            for hs_wt_tt in pl.range(GATE_T_TILE):
-                if t1 + hs_wt_tt < active_tokens:
-                    for hs_wt_k in pl.range(TOPK):
-                        pl.write(indices, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_idx_read, [hs_wt_tt, hs_wt_k]))
-                        pl.write(weights, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_weights_pad, [hs_wt_tt, hs_wt_k]))
+        if _USE_ROUTE_HASH_AIV:
+            with pl.spmd(
+                ROUTE_HASH_AIV_TOKENS,
+                name_hint="route_hash_aiv",
+                allow_early_resolve=True,
+            ):
+                weights = route_hash_aiv_cce(
+                    weights,
+                    indices,
+                    route_scores_buf,
+                    input_ids,
+                    tid2eid,
+                    num_tokens,
+                )
+        else:
+            for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True):
+                t1 = th_idx * GATE_T_TILE
+                # eids from tid2eid[input_ids]: scalar lookup (dynamic row index) into a
+                # Tensor. tid2eid row load hits the 32B tile floor (TOPK*4=24B), so the
+                # index build stays scalar; the score fetch is a batched gather below.
+                # Tail [TOPK, TOPK_PAD) zeroed so fillpad drops it from the sum.
+                hs_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
+                for hs_tt in pl.range(GATE_T_TILE):
+                    hs_token = pl.cast(pl.read(input_ids, [t1 + hs_tt]), pl.INDEX)
+                    for hs_k in pl.range(TOPK):
+                        pl.write(hs_idx_tile, [hs_tt, hs_k], pl.read(tid2eid, [hs_token, hs_k]))
+                    for hs_pad_k in pl.range(TOPK, TOPK_PAD):
+                        pl.write(hs_idx_tile, [hs_tt, hs_pad_k], pl.cast(0, pl.INT32))
+                # Batched score gather (replaces per-eid scalar reads); set_validshape +
+                # fillpad zero the [TOPK, TOPK_PAD) tail so row_sum sees only TOPK.
+                local_scores = pl.create_tensor([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32)
+                local_scores[:, :] = route_scores_buf[t1 : t1 + GATE_T_TILE, :]
+                gather_all = pl.gather(local_scores, dim=-1, index=hs_idx_tile)
+                gather_valid = pl.set_validshape(gather_all, GATE_T_TILE, TOPK)
+                hs_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
+                # Copy to dodge the tensor_view-vs-ptr SSA conflict between the gather
+                # and the scalar pl.read below (pypto #1493).
+                hs_idx_read = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
+                hs_idx_read[:, :] = hs_idx_tile[:, :]
+                hs_denom = pl.reshape(pl.row_sum(hs_vals_pad), [GATE_T_TILE, 1])
+                hs_weights_pad = pl.mul(pl.row_expand_div(hs_vals_pad, hs_denom), ROUTE_SCALE)
+                for hs_wt_tt in pl.range(GATE_T_TILE):
+                    if t1 + hs_wt_tt < active_tokens:
+                        for hs_wt_k in pl.range(TOPK):
+                            pl.write(indices, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_idx_read, [hs_wt_tt, hs_wt_k]))
+                            pl.write(weights, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_weights_pad, [hs_wt_tt, hs_wt_k]))
     else:
         for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=True):
             t1 = ts_idx * GATE_T_TILE
