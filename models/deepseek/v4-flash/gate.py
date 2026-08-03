@@ -122,7 +122,7 @@ def gate(
         pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
         xg_sq_col = pl.reshape(xg_sq, [ROW_PAD, 1])
         xg_sq_matrix = pl.row_expand(
-            pl.full([ROW_PAD, ROW_PAD], dtype=pl.FP32, value=0.0),
+            pl.tile.full([ROW_PAD, ROW_PAD], dtype=pl.FP32, value=0.0),
             xg_sq_col,
         )
         xg_sq_row = xg_sq_matrix[0:1, :]
