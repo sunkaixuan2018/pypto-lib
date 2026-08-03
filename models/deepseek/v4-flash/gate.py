@@ -248,12 +248,15 @@ def gate(
             for sr_tt in pl.range(GATE_T_TILE):
                 sr_row = biased_scores_buf[t1 + sr_tt : t1 + sr_tt + 1, :]
                 sr_idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
-                sr_sorted = pl.sort32(sr_row, sr_idx_init)
+                sr_sorted32 = pl.sort32(sr_row, sr_idx_init)
                 if SCORE_PAD == 64:
-                    sr_sorted = pl.mrgsort(sr_sorted[:, 0:64], sr_sorted[:, 64:128])
+                    sr_merged64 = pl.mrgsort(sr_sorted32[:, 0:64], sr_sorted32[:, 64:128])
+                    sr_pairs = sr_merged64[:, 0:SORT_PAD]
                 elif SCORE_PAD == 128:
-                    sr_sorted = pl.mrgsort(sr_sorted, block_len=64)
-                sr_pairs = sr_sorted[:, 0:SORT_PAD]
+                    sr_merged128 = pl.mrgsort(sr_sorted32, block_len=64)
+                    sr_pairs = sr_merged128[:, 0:SORT_PAD]
+                else:
+                    sr_pairs = sr_sorted32[:, 0:SORT_PAD]
                 sr_i = pl.gather(sr_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
                 topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
             # Batched gather; set_validshape+fillpad zeros the [TOPK, TOPK_PAD)
