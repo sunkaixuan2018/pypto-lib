@@ -475,8 +475,8 @@ def _hc_pre_separate(
                 acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
             else:
                 acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
-        partial = pl.reshape(acc, [1, LINEAR_T_TILE, MIX_PAD])
-        mixes_partial = pl.assemble(mixes_partial, partial, [split, t0, 0])
+        partial_3d = pl.reshape(acc, [1, LINEAR_T_TILE, MIX_PAD])
+        mixes_partial = pl.assemble(mixes_partial, partial_3d, [split, t0, 0])
 
     # Part-2-style reduction of the private split-K results. The reduction is
     # small (16 x 8 x 32 FP32 values per task) and publishes the same mixes_raw
@@ -485,11 +485,11 @@ def _hc_pre_separate(
         t0 = ob * T_TILE
         mix_sum = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
         for split in pl.pipeline(LINEAR_OK, stage=4):
-            partial = pl.reshape(
+            partial_tile = pl.reshape(
                 mixes_partial[split:split + 1, t0:t0 + T_TILE, 0:MIX_PAD],
                 [T_TILE, MIX_PAD],
             )
-            mix_sum = pl.add(mix_sum, partial)
+            mix_sum = pl.add(mix_sum, partial_tile)
         mixes_raw = pl.assemble(mixes_raw, mix_sum, [t0, 0])
 
     # split_pre_post: inv_rms-scaled pre gate -> pre_val_store (for mix_x), post gate -> post.
