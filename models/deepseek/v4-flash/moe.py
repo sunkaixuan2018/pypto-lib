@@ -262,9 +262,9 @@ def dispatch(
                     dst = eid // N_LOCAL
                     loc_e = eid - dst * N_LOCAL
                     if loc_e == e:
-                        slot = slot_ctr[dst]
-                        slot_ctr[dst] = slot + 1
-                        row = e_lane_base + slot
+                        send_slot = slot_ctr[dst]
+                        slot_ctr[dst] = send_slot + 1
+                        row = e_lane_base + send_slot
                         pld.tensor.put(
                             dst=recv_x,
                             peer=dst,
@@ -342,9 +342,9 @@ def dispatch(
                 else:
                     n = pl.cast(pl.read(recv_meta, [src, e]), pl.INDEX)
                 src_base_row = e_base_row + src * MAX_PER_SRC
-                for slot in pl.range(n):
-                    in_row = src_base_row + slot
-                    out_col = b + slot
+                for recv_slot in pl.range(n):
+                    in_row = src_base_row + recv_slot
+                    out_col = b + recv_slot
                     out_row = e_base_row + out_col
                     recv_x_out_flat[out_row : out_row + 1, :] = (
                         recv_x[in_row : in_row + 1, :]
