@@ -116,11 +116,10 @@ D_CHUNK = 256  # mix_x inner D-fragment (BF16 load = 1KB, 512B-aligned)
 D_SPMD = 1024  # mix_x D per spmd block: decode fans 4096 reduce over D/D_SPMD cores
 CAST_K_SPMD = 2048  # cast K per spmd block: decode fans the BF16->FP32 cast over HC_DIM/CAST_K_SPMD cores
 # Split the K=HC_DIM reduction into LINEAR_OK slices that atomic-add their FP32
-# partials. Decode has one 16-row tile, so 16 slices occupy most of the 24 Cube
-# cores and shorten each task from 16 K chunks to 4. This mirrors the official
-# HcPre split-K strategy (22 active K partitions for this shape) while keeping
-# evenly divisible 1024-wide slices for PyPTO's fixed-shape matmul pipeline.
-LINEAR_OK = 16
+# partials, filling idle cubes at small T (decode: 1 token-tile -> LINEAR_OK
+# cube tasks) and shortening each task's matmul_acc chain. Higher OK fills more
+# decode cubes; prefill (8 token-tiles) packs OK*8 tasks into waves of ~24.
+LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
 
@@ -441,7 +440,6 @@ def _hc_pre_separate(
     hc_base_2d = pl.reshape(hc_base, [1, MIX_HC])  # for per-group comb base loads in comb_sinkhorn
 
     inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
-    sq_sum_acc = pl.create_tensor([1, t_linear], dtype=pl.FP32)
     # x arrives as FP32 from the prior hc_post (the hc residual stream is FP32 end-to-end),
     # so the old BF16->FP32 cast scope + x_fp32 staging buffer are gone: linear / rms read
     # x_flat directly. The 8->16 pad rows of the cube tile are never materialized -- the
@@ -449,31 +447,24 @@ def _hc_pre_separate(
     # the t_dim real rows.
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
 
-    # seed: zero both split-K accumulators. Keeping the two small clears in one task lets
-    # the linear Cube work and RMS Vector work start together after a single dependency.
+    # rms: full-K sum-of-squares per token-tile -> inv_rms (one scope, no split-K).
+    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms", allow_early_resolve=True):
+        t0 = t * T_TILE
+        sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        for kb in pl.pipeline(HC_DIM // RMS_K_CHUNK, stage=4):
+            k0 = kb * RMS_K_CHUNK
+            x_chunk = x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK]
+            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]))
+        inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
+        inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
+
+    # seed: zero mixes_raw for the split-K atomic-add accumulation. ONE task (single InCore
+    # region) loops the t_linear // T_TILE row-blocks internally, instead of fanning them out.
+    # On-core (not create_tensor init_value=0): AICPU init serializes on the scheduler and
+    # roughly doubles the decode orch window, whereas the on-core memset overlaps.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_seed", allow_early_resolve=True):
         for ts0 in pl.range(0, t_linear, T_TILE):
             mixes_raw[ts0:ts0 + T_TILE, 0:MIX_PAD] = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
-            sq_sum_acc[0:1, ts0:ts0 + T_TILE] = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-
-    # rms: split the 16384-wide reduction over 16 Vector tasks. This mirrors the
-    # official HcPre part-1 schedule instead of leaving decode on one long AIV lane.
-    for task in pl.spmd((t_dim // T_TILE) * RMS_OK, name_hint="hc_pre_rms", allow_early_resolve=True):
-        t0 = (task // RMS_OK) * T_TILE
-        k_base = (task % RMS_OK) * RMS_K_PER_SPLIT
-        sq_part = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        for kb in pl.pipeline(RMS_CHUNKS_PER_SPLIT, stage=4):
-            k0 = k_base + kb * RMS_K_CHUNK
-            x_chunk = x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK]
-            sq_part = pl.add(sq_part, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]))
-        sq_sum_acc = pl.assemble(sq_sum_acc, sq_part, [0, t0], atomic=pl.AtomicType.Add)
-
-    # Finalize the split reduction in a separate short task after all partials publish.
-    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rsqrt", allow_early_resolve=True):
-        t0 = t * T_TILE
-        sq_sum = sq_sum_acc[0:1, t0:t0 + T_TILE]
-        inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
-        inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
 
     # linear: split-K matmul; each (row-block, K-slice) atomic-adds its FP32 partial.
     for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear", allow_early_resolve=True):
