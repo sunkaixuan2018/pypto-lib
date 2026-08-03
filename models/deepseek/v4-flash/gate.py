@@ -42,11 +42,10 @@ assert D % ROW_PAD == 0
 GATE_D_TILE = 2048
 assert D % GATE_D_TILE == 0, "gate K-loop must cover D"
 QUANT_TILE = 256
-SCORE_PAD = N_EXPERTS   # active expert row; EP2/4/8 compile to 32/64/128
+SCORE_PAD = 256         # padded expert row for sort32 + mrgsort
 TOPK_PAD = 8            # TOPK padded to 32B-aligned width
 SORT_PAD = TOPK_PAD * 2 # (val, idx) interleaved slice width
 assert TOPK <= TOPK_PAD
-assert SCORE_PAD in (32, 64, 128)
 
 @pl.jit.inline
 def gate(
@@ -243,20 +242,15 @@ def gate(
             # is rejected.
             topk_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
             # ptoas pto.tmrgsort requires src rows == 1; sort path iterates
-            # row-by-row. EP2 is one sort32 run, EP4 merges two runs, and EP8
-            # uses one four-way merge.
+            # row-by-row. sort32: [1,256]→[1,512] (8 runs of 64). mrgsort
+            # format1 4-way: 8→2 runs of 256. format2 2-way: 2→1 run of 512.
             for sr_tt in pl.range(GATE_T_TILE):
                 sr_row = biased_scores_buf[t1 + sr_tt : t1 + sr_tt + 1, :]
                 sr_idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
-                sr_sorted32 = pl.sort32(sr_row, sr_idx_init)
-                if SCORE_PAD == 64:
-                    sr_merged64 = pl.mrgsort(sr_sorted32[:, 0:64], sr_sorted32[:, 64:128])
-                    sr_pairs = sr_merged64[:, 0:SORT_PAD]
-                elif SCORE_PAD == 128:
-                    sr_merged128 = pl.mrgsort(sr_sorted32, block_len=64)
-                    sr_pairs = sr_merged128[:, 0:SORT_PAD]
-                else:
-                    sr_pairs = sr_sorted32[:, 0:SORT_PAD]
+                sr_sorted = pl.sort32(sr_row, sr_idx_init)
+                sr_sorted = pl.mrgsort(sr_sorted, block_len=64)
+                sr_sorted = pl.mrgsort(sr_sorted[:, 0:256], sr_sorted[:, 256:512])
+                sr_pairs = sr_sorted[:, 0:SORT_PAD]
                 sr_i = pl.gather(sr_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
                 topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
             # Batched gather; set_validshape+fillpad zeros the [TOPK, TOPK_PAD)
