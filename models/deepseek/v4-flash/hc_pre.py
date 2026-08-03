@@ -116,10 +116,11 @@ D_CHUNK = 256  # mix_x inner D-fragment (BF16 load = 1KB, 512B-aligned)
 D_SPMD = 1024  # mix_x D per spmd block: decode fans 4096 reduce over D/D_SPMD cores
 CAST_K_SPMD = 2048  # cast K per spmd block: decode fans the BF16->FP32 cast over HC_DIM/CAST_K_SPMD cores
 # Split the K=HC_DIM reduction into LINEAR_OK slices that atomic-add their FP32
-# partials, filling idle cubes at small T (decode: 1 token-tile -> LINEAR_OK
-# cube tasks) and shortening each task's matmul_acc chain. Higher OK fills more
-# decode cubes; prefill (8 token-tiles) packs OK*8 tasks into waves of ~24.
-LINEAR_OK = 4
+# partials. Decode has one 16-row tile, so 16 slices occupy most of the 24 Cube
+# cores and shorten each task from 16 K chunks to 4. This mirrors the official
+# HcPre split-K strategy (22 active K partitions for this shape) while keeping
+# evenly divisible 1024-wide slices for PyPTO's fixed-shape matmul pipeline.
+LINEAR_OK = 16
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
 
