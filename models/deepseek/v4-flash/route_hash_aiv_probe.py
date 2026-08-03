@@ -36,7 +36,7 @@ def route_hash_aiv_probe(
         name_hint="route_hash_aiv",
         allow_early_resolve=True,
     ):
-        weights = route_hash_aiv_cce(
+        weights, indices = route_hash_aiv_cce(
             weights,
             indices,
             route_scores,
