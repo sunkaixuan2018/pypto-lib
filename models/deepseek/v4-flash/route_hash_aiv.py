@@ -55,7 +55,9 @@ def _cann_include_dirs() -> tuple[Path, ...]:
 )
 def route_hash_aiv_cce(
     weights: pl.InOut[pl.Tensor],
-    indices: pl.InOut[pl.Tensor],
+    # Single-return externs can only thread the first output-like tensor
+    # through SSA. The kernel also writes indices as an explicit side effect.
+    indices: pl.Tensor,
     route_scores: pl.Tensor,
     input_ids: pl.Tensor,
     tid2eid: pl.Tensor,
