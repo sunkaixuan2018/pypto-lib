@@ -116,10 +116,10 @@ D_CHUNK = 256  # mix_x inner D-fragment (BF16 load = 1KB, 512B-aligned)
 D_SPMD = 1024  # mix_x D per spmd block: decode fans 4096 reduce over D/D_SPMD cores
 CAST_K_SPMD = 2048  # cast K per spmd block: decode fans the BF16->FP32 cast over HC_DIM/CAST_K_SPMD cores
 # Split the K=HC_DIM reduction into private partials, then reduce them once.
-# Sixteen 1024-wide slices occupy most decode Cube cores without a tail slice.
+# Eight 2048-wide slices balance decode Cube occupancy and reduction overhead.
 # This follows the official HcPre part-1/part-2 handoff and avoids split-K
 # atomic-add contention plus the separate zero-seed task.
-LINEAR_OK = 16
+LINEAR_OK = 8
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
 
