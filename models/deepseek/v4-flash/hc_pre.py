@@ -115,11 +115,11 @@ LINEAR_K_CHUNK = 256  # cube K-fragment per matmul_acc (32x256x4 FP32 weight fit
 D_CHUNK = 256  # mix_x inner D-fragment (BF16 load = 1KB, 512B-aligned)
 D_SPMD = 1024  # mix_x D per spmd block: decode fans 4096 reduce over D/D_SPMD cores
 CAST_K_SPMD = 2048  # cast K per spmd block: decode fans the BF16->FP32 cast over HC_DIM/CAST_K_SPMD cores
-# Split the K=HC_DIM reduction into LINEAR_OK slices that atomic-add their FP32
-# partials, filling idle cubes at small T (decode: 1 token-tile -> LINEAR_OK
-# cube tasks) and shortening each task's matmul_acc chain. Higher OK fills more
-# decode cubes; prefill (8 token-tiles) packs OK*8 tasks into waves of ~24.
-LINEAR_OK = 4
+# Split the K=HC_DIM reduction into private partials, then reduce them once.
+# Sixteen 1024-wide slices occupy most decode Cube cores without a tail slice.
+# This follows the official HcPre part-1/part-2 handoff and avoids split-K
+# atomic-add contention plus the separate zero-seed task.
+LINEAR_OK = 16
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
 
@@ -446,6 +446,7 @@ def _hc_pre_separate(
     # linear matmul masks them with valid_shape (zero-fill past t_dim), and rms only reads
     # the t_dim real rows.
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
+    mixes_partial = pl.create_tensor([LINEAR_OK, t_linear, MIX_PAD], dtype=pl.FP32)
 
     # rms: full-K sum-of-squares per token-tile -> inv_rms (one scope, no split-K).
     for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms", allow_early_resolve=True):
@@ -458,18 +459,12 @@ def _hc_pre_separate(
         inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
         inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
 
-    # seed: zero mixes_raw for the split-K atomic-add accumulation. ONE task (single InCore
-    # region) loops the t_linear // T_TILE row-blocks internally, instead of fanning them out.
-    # On-core (not create_tensor init_value=0): AICPU init serializes on the scheduler and
-    # roughly doubles the decode orch window, whereas the on-core memset overlaps.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_seed", allow_early_resolve=True):
-        for ts0 in pl.range(0, t_linear, T_TILE):
-            mixes_raw[ts0:ts0 + T_TILE, 0:MIX_PAD] = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
-
-    # linear: split-K matmul; each (row-block, K-slice) atomic-adds its FP32 partial.
+    # linear: each K slice writes a private result, so all Cube tasks can start
+    # immediately without waiting for a shared accumulator to be zeroed.
     for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear", allow_early_resolve=True):
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
-        k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
+        split = task % LINEAR_OK
+        k_base = split * LINEAR_K_PER_SPLIT
         t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
         acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
@@ -480,7 +475,22 @@ def _hc_pre_separate(
                 acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
             else:
                 acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
-        mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
+        partial = pl.reshape(acc, [1, LINEAR_T_TILE, MIX_PAD])
+        mixes_partial = pl.assemble(mixes_partial, partial, [split, t0, 0])
+
+    # Part-2-style reduction of the private split-K results. The reduction is
+    # small (16 x 8 x 32 FP32 values per task) and publishes the same mixes_raw
+    # layout consumed by the existing gate/Sinkhorn/mix stages.
+    for ob in pl.spmd(t_linear // T_TILE, name_hint="hc_pre_linear_reduce", allow_early_resolve=True):
+        t0 = ob * T_TILE
+        mix_sum = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
+        for split in pl.pipeline(LINEAR_OK, stage=4):
+            partial = pl.reshape(
+                mixes_partial[split:split + 1, t0:t0 + T_TILE, 0:MIX_PAD],
+                [T_TILE, MIX_PAD],
+            )
+            mix_sum = pl.add(mix_sum, partial)
+        mixes_raw = pl.assemble(mixes_raw, mix_sum, [t0, 0])
 
     # split_pre_post: inv_rms-scaled pre gate -> pre_val_store (for mix_x), post gate -> post.
     # Both compute at HC_PAD width; post narrows to HC_MULT via a valid-shape slice (an 8-wide
