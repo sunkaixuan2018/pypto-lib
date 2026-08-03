@@ -69,6 +69,7 @@ def gate(
     # a sqsum pass followed by a separate normalize pass.
     xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
     inv_rms_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
+    xn_scale_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
     route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     active_tokens = pl.cast(num_tokens, pl.INDEX)
@@ -104,8 +105,6 @@ def gate(
         xg_abs_rows = pl.reshape(pl.abs(xg), [ROW_PAD, FFN_REDUCE_TILE])
         amax_partial_tmp = pl.create_tile([ROW_PAD, FFN_REDUCE_TILE], dtype=pl.FP32)
         amax_partial = pl.row_max(xg_abs_rows, amax_partial_tmp)
-        xg_amax_quant = pl.maximum(pl.col_max(amax_partial), INT8_AMAX_EPS)
-        xg_sq_quant = pl.mul(pl.recip(xg_amax_quant), INT8_SCALE_MAX)
         amax_reduce = pl.create_tile([ROW_PAD, ROW_PAD], dtype=pl.FP32)
         amax_reduce[0:1, :] = pl.reshape(amax_partial, [1, ROW_PAD])
         amax_reduce = pl.set_validshape(amax_reduce, 1, ROW_PAD)
@@ -122,7 +121,8 @@ def gate(
         xg_dequant_scale = pl.mul(xg_amax, 1.0 / INT8_SCALE_MAX)
         x_norm_dequant_scale = pl.mul(xg_dequant_scale, inv_rms)
         pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
-        xn_q_scaled = pl.row_expand_mul(xg, xg_sq_quant)
+        pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
+        xn_q_scaled = pl.row_expand_mul(xg, xn_scale_buf[tok : tok + 1, 0:1])
         xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
         xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
         pl.tile.store(
