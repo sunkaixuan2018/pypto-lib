@@ -73,7 +73,7 @@ _USE_ROUTE_HASH_GATE_AIV = (
     and SCORE_PAD == ROUTE_HASH_AIV_SCORE_PAD
     and GATE_N_BLOCKS == T
 )
-ROUTE_SYNC_SLOTS = GATE_N_BLOCKS * 8
+GATE_TASK_BLOCKS = 24 if _USE_ROUTE_HASH_GATE_AIV else GATE_N_BLOCKS
 
 @pl.jit.inline
 def gate(
@@ -104,7 +104,6 @@ def gate(
     xn_scale_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
     route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
-    route_sync_ws = pl.create_tensor([ROUTE_SYNC_SLOTS], dtype=pl.INT32)
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
@@ -184,13 +183,6 @@ def gate(
     # columns so the sort ranks pad experts last. Route write-backs are guarded to
     # active tokens, so the inactive-zero can run here rather than post-route.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
-        if _USE_ROUTE_HASH_GATE_AIV:
-            for route_sync_i in pl.range(ROUTE_SYNC_SLOTS):
-                pl.write(
-                    route_sync_ws,
-                    [route_sync_i],
-                    pl.cast(0, pl.INT32),
-                )
         for zt in pl.range(T):
             if zt >= active_tokens:
                 pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
@@ -205,49 +197,45 @@ def gate(
     # Fan the matmul over expert columns so each block computes a [GATE_M_TILE,
     # GATE_N_TILE] slice on its own core; token-tile is the dynamic dim, so it
     # stays outermost and // % divide by the compile-time GATE_N_BLOCKS.
-    for gb_idx in pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate", allow_early_resolve=True):
-        tg = gb_idx // GATE_N_BLOCKS
-        nb = gb_idx % GATE_N_BLOCKS
+    for gb_idx in pl.spmd(active_gate_tiles * GATE_TASK_BLOCKS, name_hint="gate", allow_early_resolve=True):
+        tg = gb_idx // GATE_TASK_BLOCKS
+        nb = gb_idx % GATE_TASK_BLOCKS
         t1 = tg * GATE_M_TILE
-        n0 = nb * GATE_N_TILE
-        gp_bias_row = pl.reshape(gate_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
-        gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
-        for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
-            gd_kd = kb * GATE_D_TILE
-            gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
-            gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
-            if gd_kd == 0:
-                gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
-            else:
-                gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
-        # xg omitted inv_rms; logits = inv_rms * (xg @ gate_w.T). Per-token row-scale.
-        gate_logits_tile = pl.row_expand_mul(gate_logits_tile, inv_rms_buf[t1 : t1 + GATE_M_TILE, 0:1])
-        gp_relu = pl.maximum(gate_logits_tile, 0.0)
-        gp_abs = pl.maximum(gate_logits_tile, pl.neg(gate_logits_tile))
-        gp_softplus_log = pl.add(gp_relu, pl.log(pl.add(pl.exp(pl.neg(gp_abs)), 1.0)))
-        gp_neg_floor_mask = pl.minimum(pl.maximum(pl.sub(pl.neg(gate_logits_tile), 10.0), 0.0), 1.0)
-        gp_neg_floor = pl.mul(gp_neg_floor_mask, pl.exp(pl.minimum(gate_logits_tile, 0.0)))
-        gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
-        gp_score = pl.sqrt(gp_softplus)
-        route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
-        if layer_id >= N_HASH_LAYERS:
-            gp_bias = pl.col_expand_mul(pl.full([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32, value=1.0), gp_bias_row)
-            gp_biased = pl.add(gp_score, gp_bias)
-            biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
-        if _USE_ROUTE_HASH_GATE_AIV and layer_id < N_HASH_LAYERS:
-            # A2/A3 dispatches the no-split vector body to both AIV lanes.
-            # Only AIV0 owns the actual gate post-processing. Explicitly keep
-            # AIV1 out of the soft barrier and give it an inactive route row;
-            # otherwise its replay path double-arrives at the same logical
-            # block's sync slot and can leave the barrier waiting for 500 ms.
-            route_lane = pl.tile.get_subblock_idx()
-            if route_lane == 0:
-                pl.system.syncall(
-                    mode="soft",
-                    core_type="aiv_only",
-                    gm_workspace=route_sync_ws,
-                    used_cores=GATE_N_BLOCKS,
+        if nb < GATE_N_BLOCKS:
+            n0 = nb * GATE_N_TILE
+            gp_bias_row = pl.reshape(gate_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
+            gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
+            for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
+                gd_kd = kb * GATE_D_TILE
+                gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
+                gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
+                if gd_kd == 0:
+                    gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
+                else:
+                    gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
+            # xg omitted inv_rms; logits = inv_rms * (xg @ gate_w.T). Per-token row-scale.
+            gate_logits_tile = pl.row_expand_mul(gate_logits_tile, inv_rms_buf[t1 : t1 + GATE_M_TILE, 0:1])
+            gp_relu = pl.maximum(gate_logits_tile, 0.0)
+            gp_abs = pl.maximum(gate_logits_tile, pl.neg(gate_logits_tile))
+            gp_softplus_log = pl.add(gp_relu, pl.log(pl.add(pl.exp(pl.neg(gp_abs)), 1.0)))
+            gp_neg_floor_mask = pl.minimum(pl.maximum(pl.sub(pl.neg(gate_logits_tile), 10.0), 0.0), 1.0)
+            gp_neg_floor = pl.mul(gp_neg_floor_mask, pl.exp(pl.minimum(gate_logits_tile, 0.0)))
+            gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
+            gp_score = pl.sqrt(gp_softplus)
+            route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
+            if layer_id >= N_HASH_LAYERS:
+                gp_bias = pl.col_expand_mul(
+                    pl.full([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32, value=1.0),
+                    gp_bias_row,
                 )
+                gp_biased = pl.add(gp_score, gp_bias)
+                biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
+        if _USE_ROUTE_HASH_GATE_AIV and layer_id < N_HASH_LAYERS:
+            # Full occupancy makes the hardware barrier valid in the persistent
+            # executor. The first eight blocks publish the expert score slices;
+            # the remaining blocks are barrier-only participants.
+            pl.system.syncall(core_type="mix")
+            route_lane = pl.tile.get_subblock_idx()
             route_row = nb + route_lane * T
             if route_row < active_tokens:
                 fused_token = pl.cast(pl.read(input_ids, [route_row]), pl.INDEX)
