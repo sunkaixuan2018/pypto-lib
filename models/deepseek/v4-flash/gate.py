@@ -44,6 +44,7 @@ GATE_M_TILE = 16        # cube M-tile: matmul rows must be a multiple of 16 (fra
 GATE_N_TILE = 16        # expert columns per gate spmd block
 assert N_EXPERTS % GATE_N_TILE == 0
 GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
+GATE_AIV_LANES = 2
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 D_TILE = 256
 ROW_PAD = 8
@@ -73,7 +74,8 @@ _USE_ROUTE_HASH_GATE_AIV = (
     and SCORE_PAD == ROUTE_HASH_AIV_SCORE_PAD
     and GATE_N_BLOCKS == T
 )
-ROUTE_SYNC_SLOTS = GATE_N_BLOCKS * 8
+ROUTE_SYNC_CORES = GATE_N_BLOCKS * GATE_AIV_LANES
+ROUTE_SYNC_SLOTS = ROUTE_SYNC_CORES * 8
 
 @pl.jit.inline
 def gate(
@@ -235,15 +237,16 @@ def gate(
             gp_biased = pl.add(gp_score, gp_bias)
             biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
         if _USE_ROUTE_HASH_GATE_AIV and layer_id < N_HASH_LAYERS:
-            # Every gate AIV block has produced one 16-expert score slice.
-            # The partial-occupancy soft barrier publishes all eight slices
-            # without launching a standalone route task. Block nb then routes
-            # token nb, so the eight blocks write disjoint output rows.
+            # The mixed task dispatches AIV0 and AIV1 for every gate block.
+            # ExpandMixedKernel keeps the vector work and route write-back on
+            # AIV0, but both lanes execute this soft barrier, so all 16 physical
+            # AIV participants must be counted. After the barrier, AIV0 block nb
+            # routes token nb and the eight active writers touch disjoint rows.
             pl.system.syncall(
                 mode="soft",
                 core_type="aiv_only",
                 gm_workspace=route_sync_ws,
-                used_cores=GATE_N_BLOCKS,
+                used_cores=ROUTE_SYNC_CORES,
             )
             route_row = nb
             if route_row < active_tokens:
