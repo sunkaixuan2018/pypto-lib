@@ -43,6 +43,7 @@ GATE_T_TILE = 8
 GATE_M_TILE = 16        # cube M-tile: matmul rows must be a multiple of 16 (fractal)
 GATE_N_TILE = 16        # expert columns per gate spmd block
 assert N_EXPERTS % GATE_N_TILE == 0
+GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 D_TILE = 256
 ROW_PAD = 8
@@ -64,6 +65,15 @@ _USE_ROUTE_HASH_AIV = (
     and TOPK == ROUTE_HASH_AIV_TOPK
     and SCORE_PAD == ROUTE_HASH_AIV_SCORE_PAD
 )
+_USE_ROUTE_HASH_GATE_AIV = (
+    _ROUTE_HASH_IMPL == "gate_aiv"
+    and T == ROUTE_HASH_AIV_TOKENS
+    and N_EXPERTS == ROUTE_HASH_AIV_EXPERTS
+    and TOPK == ROUTE_HASH_AIV_TOPK
+    and SCORE_PAD == ROUTE_HASH_AIV_SCORE_PAD
+    and GATE_N_BLOCKS == T
+)
+ROUTE_SYNC_SLOTS = GATE_N_BLOCKS * 8
 
 @pl.jit.inline
 def gate(
@@ -94,6 +104,7 @@ def gate(
     xn_scale_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
     route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
+    route_sync_ws = pl.create_tensor([ROUTE_SYNC_SLOTS], dtype=pl.INT32)
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
@@ -173,6 +184,12 @@ def gate(
     # columns so the sort ranks pad experts last. Route write-backs are guarded to
     # active tokens, so the inactive-zero can run here rather than post-route.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
+        if _USE_ROUTE_HASH_GATE_AIV:
+            route_sync_ws[:] = pl.full(
+                [ROUTE_SYNC_SLOTS],
+                dtype=pl.INT32,
+                value=0,
+            )
         for zt in pl.range(T):
             if zt >= active_tokens:
                 pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
@@ -187,7 +204,6 @@ def gate(
     # Fan the matmul over expert columns so each block computes a [GATE_M_TILE,
     # GATE_N_TILE] slice on its own core; token-tile is the dynamic dim, so it
     # stays outermost and // % divide by the compile-time GATE_N_BLOCKS.
-    GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
     for gb_idx in pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate", allow_early_resolve=True):
         tg = gb_idx // GATE_N_BLOCKS
         nb = gb_idx % GATE_N_BLOCKS
@@ -217,11 +233,73 @@ def gate(
             gp_bias = pl.col_expand_mul(pl.full([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32, value=1.0), gp_bias_row)
             gp_biased = pl.add(gp_score, gp_bias)
             biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
+        if _USE_ROUTE_HASH_GATE_AIV and layer_id < N_HASH_LAYERS:
+            # Every gate AIV block has produced one 16-expert score slice.
+            # The partial-occupancy soft barrier publishes all eight slices
+            # without launching a standalone route task. Block nb then routes
+            # token nb, so the eight blocks write disjoint output rows.
+            pl.system.syncall(
+                mode="soft",
+                core_type="aiv_only",
+                gm_workspace=route_sync_ws,
+                used_cores=GATE_N_BLOCKS,
+            )
+            route_row = nb
+            if route_row < active_tokens:
+                fused_token = pl.cast(pl.read(input_ids, [route_row]), pl.INDEX)
+                fused_idx_tile = pl.create_tensor([1, TOPK_PAD], dtype=pl.INT32)
+                for fused_k in pl.range(TOPK):
+                    pl.write(
+                        fused_idx_tile,
+                        [0, fused_k],
+                        pl.read(tid2eid, [fused_token, fused_k]),
+                    )
+                for fused_pad_k in pl.range(TOPK, TOPK_PAD):
+                    pl.write(
+                        fused_idx_tile,
+                        [0, fused_pad_k],
+                        pl.cast(0, pl.INT32),
+                    )
+                fused_scores = pl.create_tensor([1, N_EXPERTS], dtype=pl.FP32)
+                fused_scores[:, :] = route_scores_buf[
+                    route_row : route_row + 1,
+                    0:N_EXPERTS,
+                ]
+                fused_gather = pl.gather(
+                    fused_scores,
+                    dim=-1,
+                    index=fused_idx_tile,
+                )
+                fused_valid = pl.set_validshape(fused_gather, 1, TOPK)
+                fused_vals_pad = pl.fillpad(
+                    fused_valid,
+                    pad_value=pl.PadValue.zero,
+                )
+                fused_idx_read = pl.create_tensor([1, TOPK_PAD], dtype=pl.INT32)
+                fused_idx_read[:, :] = fused_idx_tile[:, :]
+                fused_denom = pl.reshape(pl.row_sum(fused_vals_pad), [1, 1])
+                fused_weights = pl.mul(
+                    pl.row_expand_div(fused_vals_pad, fused_denom),
+                    ROUTE_SCALE,
+                )
+                for fused_w_k in pl.range(TOPK):
+                    pl.write(
+                        indices,
+                        [route_row, fused_w_k],
+                        pl.read(fused_idx_read, [0, fused_w_k]),
+                    )
+                    pl.write(
+                        weights,
+                        [route_row, fused_w_k],
+                        pl.read(fused_weights, [0, fused_w_k]),
+                    )
 
     active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
     # Hash layers index via tid2eid[input_ids]; score layers sort+gather.
     if layer_id < N_HASH_LAYERS:
-        if _USE_ROUTE_HASH_AIV:
+        if _USE_ROUTE_HASH_GATE_AIV:
+            pass
+        elif _USE_ROUTE_HASH_AIV:
             with pl.spmd(
                 ROUTE_HASH_AIV_TOKENS,
                 name_hint="route_hash_aiv",
