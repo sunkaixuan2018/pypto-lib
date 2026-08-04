@@ -185,11 +185,12 @@ def gate(
     # active tokens, so the inactive-zero can run here rather than post-route.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
         if _USE_ROUTE_HASH_GATE_AIV:
-            route_sync_ws[:] = pl.full(
-                [ROUTE_SYNC_SLOTS],
-                dtype=pl.INT32,
-                value=0,
-            )
+            for route_sync_i in pl.range(ROUTE_SYNC_SLOTS):
+                pl.write(
+                    route_sync_ws,
+                    [route_sync_i],
+                    pl.cast(0, pl.INT32),
+                )
         for zt in pl.range(T):
             if zt >= active_tokens:
                 pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
@@ -247,7 +248,12 @@ def gate(
             route_row = nb
             if route_row < active_tokens:
                 fused_token = pl.cast(pl.read(input_ids, [route_row]), pl.INDEX)
-                fused_idx_tile = pl.create_tensor([1, TOPK_PAD], dtype=pl.INT32)
+                # Physical rows stay at eight so column-major scratch obeys the
+                # 32-byte column alignment rule; only row 0 is marked valid.
+                fused_idx_tile = pl.create_tensor(
+                    [TOPK_PAD, TOPK_PAD],
+                    dtype=pl.INT32,
+                )
                 for fused_k in pl.range(TOPK):
                     pl.write(
                         fused_idx_tile,
@@ -260,24 +266,40 @@ def gate(
                         [0, fused_pad_k],
                         pl.cast(0, pl.INT32),
                     )
-                fused_scores = pl.create_tensor([1, N_EXPERTS], dtype=pl.FP32)
-                fused_scores[:, :] = route_scores_buf[
+                fused_idx_valid = pl.set_validshape(
+                    fused_idx_tile,
+                    1,
+                    TOPK_PAD,
+                )
+                fused_scores = pl.create_tensor(
+                    [TOPK_PAD, N_EXPERTS],
+                    dtype=pl.FP32,
+                )
+                fused_scores[0:1, :] = route_scores_buf[
                     route_row : route_row + 1,
                     0:N_EXPERTS,
                 ]
-                fused_gather = pl.gather(
+                fused_scores_valid = pl.set_validshape(
                     fused_scores,
+                    1,
+                    N_EXPERTS,
+                )
+                fused_gather = pl.gather(
+                    fused_scores_valid,
                     dim=-1,
-                    index=fused_idx_tile,
+                    index=fused_idx_valid,
                 )
                 fused_valid = pl.set_validshape(fused_gather, 1, TOPK)
                 fused_vals_pad = pl.fillpad(
                     fused_valid,
                     pad_value=pl.PadValue.zero,
                 )
-                fused_idx_read = pl.create_tensor([1, TOPK_PAD], dtype=pl.INT32)
-                fused_idx_read[:, :] = fused_idx_tile[:, :]
-                fused_denom = pl.reshape(pl.row_sum(fused_vals_pad), [1, 1])
+                fused_idx_read = pl.create_tensor(
+                    [TOPK_PAD, TOPK_PAD],
+                    dtype=pl.INT32,
+                )
+                fused_idx_read[0:1, :] = fused_idx_tile[0:1, :]
+                fused_denom = pl.row_sum(fused_vals_pad)
                 fused_weights = pl.mul(
                     pl.row_expand_div(fused_vals_pad, fused_denom),
                     ROUTE_SCALE,
